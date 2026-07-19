@@ -10,6 +10,7 @@ import krec
 import kmsg
 import net
 import sync
+import time
 
 // ClusterCfg configures a fake cluster.
 pub struct ClusterCfg {
@@ -18,7 +19,15 @@ pub mut:
 	advertised map[i16]i16 = {
 		i16(0):  i16(9)
 		i16(1):  i16(12)
+		i16(2):  i16(7)
 		i16(3):  i16(12)
+		i16(8):  i16(6)
+		i16(9):  i16(5)
+		i16(10): i16(2)
+		i16(11): i16(5)
+		i16(12): i16(3)
+		i16(13): i16(2)
+		i16(14): i16(3)
 		i16(18): i16(3)
 	}
 	// api_versions_max caps the ApiVersions request version accepted;
@@ -45,9 +54,11 @@ pub:
 pub mut:
 	ports []int
 mut:
-	mu     &sync.Mutex = sync.new_mutex()
-	fails  int
-	stored map[string][]kmsg.Record // 'topic/partition' -> records
+	mu          &sync.Mutex = sync.new_mutex()
+	fails       int
+	stored      map[string][]kmsg.Record // 'topic/partition' -> records
+	groups      map[string]&kmsg.FakeGroup
+	next_member int
 }
 
 // start launches a fake cluster with the given node count.
@@ -154,6 +165,7 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 		r.read_nullable_string() or { '' }
 		flexible := (key == 18 && version >= 3) || (key == 3 && version >= 9)
 			|| (key == 0 && version >= 9) || (key == 1 && version >= 12)
+			|| (key == 2 && version >= 6)
 		if flexible {
 			num_tags := r.read_uvarint()
 			for _ in 0 .. num_tags {
@@ -169,6 +181,14 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			3 { cl.answer_metadata(node_id, body, version) }
 			0 { cl.answer_produce(body, version) }
 			1 { cl.answer_fetch(body, version) }
+			2 { cl.answer_list_offsets(body, version) }
+			8 { cl.answer_offset_commit(body, version) }
+			9 { cl.answer_offset_fetch(body, version) }
+			10 { cl.answer_find_coordinator(node_id, body, version) }
+			11 { cl.answer_join_group(body, version) }
+			12 { cl.answer_heartbeat(body, version) }
+			13 { cl.answer_leave_group(body, version) }
+			14 { cl.answer_sync_group(body, version) }
 			else { []u8{} }
 		}
 
@@ -344,6 +364,14 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 			cl.mu.unlock()
 			high := i64(all.len)
 			from := p.fetch_offset
+			if from < 0 || from > high {
+				resp_topic.partitions << kmsg.FetchResponseTopicPartition{
+					partition:      p.partition
+					error_code:     1 // OFFSET_OUT_OF_RANGE
+					high_watermark: high
+				}
+				continue
+			}
 			mut batches := ?[]u8(none)
 			if from >= 0 && from < high {
 				serve := all[from..].clone()
@@ -362,6 +390,347 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 		}
 		resp.topics << resp_topic
 	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+// answer_list_offsets resolves earliest (-2) to 0 and latest (-1) to the
+// stored record count.
+fn (mut cl Cluster) answer_list_offsets(body []u8, version i16) []u8 {
+	mut req := kmsg.ListOffsetsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+
+	mut resp := kmsg.ListOffsetsResponse{
+		version: version
+	}
+	for t in req.topics {
+		mut resp_topic := kmsg.ListOffsetsResponseTopic{
+			topic: t.topic
+		}
+		for p in t.partitions {
+			cl.mu.lock()
+			high := i64(cl.stored['${t.topic}/${p.partition}'].len)
+			cl.mu.unlock()
+			off := if p.timestamp == -2 { i64(0) } else { high }
+			resp_topic.partitions << kmsg.ListOffsetsResponseTopicPartition{
+				partition: p.partition
+				offset:    off
+				timestamp: -1
+			}
+		}
+		resp.topics << resp_topic
+	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+// ---------------------------------------------------------------------------
+// Group coordinator: enough of the classic protocol for hermetic group
+// tests. Generations bump when membership changes; members whose join
+// generation lags get REBALANCE_IN_PROGRESS on heartbeat until they
+// rejoin; SyncGroup followers wait for the leader's assignments.
+// ---------------------------------------------------------------------------
+
+struct FakeMember {
+mut:
+	metadata  []u8 // protocol metadata of the first offered protocol
+	protocols []string
+}
+
+@[heap]
+struct FakeGroup {
+mut:
+	generation      int
+	members         map[string]kmsg.FakeMember
+	member_gen      map[string]int
+	protocol        string
+	assignments     map[string][]u8
+	assignments_gen int
+	offsets         map[string]i64 // 'topic/partition' -> committed
+}
+
+fn (mut cl Cluster) group(name string) &FakeGroup {
+	if name !in cl.groups {
+		cl.groups[name] = &kmsg.FakeGroup{}
+	}
+	return cl.groups[name]
+}
+
+fn leader_of(g &FakeGroup) string {
+	mut ids := g.members.keys()
+	ids.sort()
+	if ids.len == 0 {
+		return ''
+	}
+	return ids[0]
+}
+
+fn (mut cl Cluster) answer_find_coordinator(node_id int, body []u8, version i16) []u8 {
+	mut req := kmsg.FindCoordinatorRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.FindCoordinatorResponse{
+		version: version
+		node_id: node_id
+		host:    '127.0.0.1'
+		port:    cl.ports[node_id]
+	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_join_group(body []u8, version i16) []u8 {
+	mut req := kmsg.JoinGroupRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+
+	mut resp := kmsg.JoinGroupResponse{
+		version:    version
+		generation: -1
+	}
+	cl.mu.lock()
+	mut g := cl.group(req.group)
+	if req.member_id == '' {
+		cl.next_member++
+		resp.error_code = 79 // MEMBER_ID_REQUIRED
+		resp.member_id = 'kfake-member-${cl.next_member}'
+		cl.mu.unlock()
+		mut w0 := kmsg.Writer{}
+		resp.write_to(mut w0)
+		return w0.buf
+	}
+
+	mut protos := []string{}
+	for p in req.protocols {
+		protos << p.name
+	}
+	meta := if req.protocols.len > 0 { req.protocols[0].metadata.clone() } else { []u8{} }
+	if req.member_id !in g.members {
+		g.generation++ // membership change: everyone else must rejoin
+	}
+	g.members[req.member_id] = kmsg.FakeMember{
+		metadata:  meta
+		protocols: protos
+	}
+	g.member_gen[req.member_id] = g.generation
+	if g.protocol == '' && protos.len > 0 {
+		g.protocol = protos[0]
+	}
+	leader := leader_of(g)
+	resp.error_code = 0
+	resp.generation = g.generation
+	resp.member_id = req.member_id
+	resp.leader_id = leader
+	resp.protocol = g.protocol
+	if req.member_id == leader {
+		mut ids := g.members.keys()
+		ids.sort()
+		for id in ids {
+			resp.members << kmsg.JoinGroupResponseMember{
+				member_id:         id
+				protocol_metadata: g.members[id].metadata.clone()
+			}
+		}
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_sync_group(body []u8, version i16) []u8 {
+	mut req := kmsg.SyncGroupRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+
+	mut resp := kmsg.SyncGroupResponse{
+		version: version
+	}
+	cl.mu.lock()
+	mut g := cl.group(req.group)
+	if req.generation != g.generation {
+		resp.error_code = 22 // ILLEGAL_GENERATION
+		cl.mu.unlock()
+		mut we := kmsg.Writer{}
+		resp.write_to(mut we)
+		return we.buf
+	}
+	if req.member_id == leader_of(g) && req.group_assignment.len > 0 {
+		g.assignments = map[string][]u8{}
+		for a in req.group_assignment {
+			g.assignments[a.member_id] = a.member_assignment.clone()
+		}
+		g.assignments_gen = g.generation
+	}
+	gen := g.generation
+	cl.mu.unlock()
+
+	// wait for the leader's assignments of this generation
+	mut waited := 0
+	for {
+		cl.mu.lock()
+		mut g2 := cl.group(req.group)
+		if g2.assignments_gen == gen && g2.generation == gen {
+			resp.member_assignment = g2.assignments[req.member_id] or { []u8{} }.clone()
+			cl.mu.unlock()
+			break
+		}
+		if g2.generation != gen {
+			resp.error_code = 27 // REBALANCE_IN_PROGRESS
+			cl.mu.unlock()
+			break
+		}
+		cl.mu.unlock()
+		waited += 5
+		if waited > 3000 {
+			resp.error_code = 27
+			break
+		}
+		time.sleep(5 * time.millisecond)
+	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_heartbeat(body []u8, version i16) []u8 {
+	mut req := kmsg.HeartbeatRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.HeartbeatResponse{
+		version: version
+	}
+	cl.mu.lock()
+	mut g := cl.group(req.group)
+	if req.member_id !in g.members {
+		resp.error_code = 25 // UNKNOWN_MEMBER_ID
+	} else if g.member_gen[req.member_id] < g.generation {
+		resp.error_code = 27 // REBALANCE_IN_PROGRESS
+	} else if req.generation != g.generation {
+		resp.error_code = 22 // ILLEGAL_GENERATION
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_leave_group(body []u8, version i16) []u8 {
+	mut req := kmsg.LeaveGroupRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	cl.mu.lock()
+	mut g := cl.group(req.group)
+	if req.member_id in g.members {
+		g.members.delete(req.member_id)
+		g.member_gen.delete(req.member_id)
+		if g.members.len > 0 {
+			g.generation++ // survivors must rejoin
+		}
+	}
+	cl.mu.unlock()
+	mut resp := kmsg.LeaveGroupResponse{
+		version: version
+	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_offset_commit(body []u8, version i16) []u8 {
+	mut req := kmsg.OffsetCommitRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.OffsetCommitResponse{
+		version: version
+	}
+	cl.mu.lock()
+	mut g := cl.group(req.group)
+	stale := req.generation != g.generation
+	for t in req.topics {
+		mut rt := kmsg.OffsetCommitResponseTopic{
+			topic: t.topic
+		}
+		for p in t.partitions {
+			mut code := i16(0)
+			if stale {
+				code = 22 // ILLEGAL_GENERATION
+			} else {
+				g.offsets['${t.topic}/${p.partition}'] = p.offset
+			}
+			rt.partitions << kmsg.OffsetCommitResponseTopicPartition{
+				partition:  p.partition
+				error_code: code
+			}
+		}
+		resp.topics << rt
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_offset_fetch(body []u8, version i16) []u8 {
+	mut req := kmsg.OffsetFetchRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.OffsetFetchResponse{
+		version: version
+	}
+	req_topics := req.topics or { []kmsg.OffsetFetchRequestTopic{} }
+	cl.mu.lock()
+	mut g := cl.group(req.group)
+	for t in req_topics {
+		mut rt := kmsg.OffsetFetchResponseTopic{
+			topic: t.topic
+		}
+		for p in t.partitions {
+			off := g.offsets['${t.topic}/${p}'] or { i64(-1) }
+			rt.partitions << kmsg.OffsetFetchResponseTopicPartition{
+				partition: p
+				offset:    off
+			}
+		}
+		resp.topics << rt
+	}
+	cl.mu.unlock()
 	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf

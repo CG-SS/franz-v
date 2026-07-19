@@ -1,0 +1,243 @@
+module kgo
+
+import kfake
+import time
+
+const fast = kfake.GroupOpts{
+	heartbeat_interval: 30 * time.millisecond
+}
+
+fn test_balancers() {
+	subs := [
+		kfake.MemberSubscription{
+			member_id: 'a'
+			topics:    ['t']
+		},
+		kfake.MemberSubscription{
+			member_id: 'b'
+			topics:    ['t']
+		},
+	]
+	counts := {
+		't': 5
+	}
+	r := balance(.range_bal, subs, counts)
+	// range: 5 partitions over 2 -> first member gets 3
+	assert r['a']['t'] == [0, 1, 2]
+	assert r['b']['t'] == [3, 4]
+
+	rr := balance(.round_robin, subs, counts)
+	assert rr['a']['t'] == [0, 2, 4]
+	assert rr['b']['t'] == [1, 3]
+
+	// range with a topic only one member subscribes to
+	subs2 := [
+		kfake.MemberSubscription{
+			member_id: 'a'
+			topics:    ['t', 'u']
+		},
+		kfake.MemberSubscription{
+			member_id: 'b'
+			topics:    ['t']
+		},
+	]
+	counts2 := {
+		't': 2
+		'u': 2
+	}
+	r2 := balance(.range_bal, subs2, counts2)
+	assert r2['a']['t'] == [0]
+	assert r2['b']['t'] == [1]
+	assert r2['a']['u'] == [0, 1]
+	assert ('u' in r2['b']) == false
+}
+
+fn test_group_single_member_lifecycle() {
+	mut cl := kfake.start(1, kfake.ClusterCfg{
+		partitions_per_topic: 2
+	})
+	mut c := new_client(kfake.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 100 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c.close()
+	}
+	mut records := []kfake.Record{}
+	for i in 0 .. 6 {
+		records << kfake.Record{
+			partition: i % 2
+			value:     'v${i}'.bytes()
+		}
+	}
+	c.produce('events', mut records) or {
+		assert false, '${err}'
+		return
+	}
+
+	mut g := c.new_group_consumer('workers', ['events'], fast) or {
+		assert false, '${err}'
+		return
+	}
+	recs := g.poll() or {
+		assert false, 'poll: ${err}'
+		return
+	}
+	assert recs.len == 6
+	asg := g.assigned()
+	assert asg['events'].len == 2 // sole member owns both partitions
+	assert g.member().starts_with('kfake-member-')
+
+	g.commit() or {
+		assert false, 'commit: ${err}'
+		return
+	}
+	g.close()
+
+	// a fresh member of the same group resumes at the committed offsets
+	mut g2 := c.new_group_consumer('workers', ['events'], fast) or {
+		assert false, '${err}'
+		return
+	}
+	none_new := g2.poll() or {
+		assert false, '${err}'
+		return
+	}
+	assert none_new.len == 0
+
+	mut more := [
+		kfake.Record{
+			partition: 0
+			value:     'post-commit'.bytes()
+		},
+	]
+	c.produce('events', mut more) or {
+		assert false, '${err}'
+		return
+	}
+	got := g2.poll() or {
+		assert false, '${err}'
+		return
+	}
+	assert got.len == 1
+	v := got[0].value or { []u8{} }
+	assert v.bytestr() == 'post-commit'
+	g2.close()
+}
+
+fn test_group_two_members_rebalance() {
+	mut cl := kfake.start(1, kfake.ClusterCfg{
+		partitions_per_topic: 2
+	})
+	mut c := new_client(kfake.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 50 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c.close()
+	}
+
+	mut g1 := c.new_group_consumer('team', ['events'], fast) or {
+		assert false, '${err}'
+		return
+	}
+	g1.poll() or {
+		assert false, 'g1 first poll: ${err}'
+		return
+	}
+	assert g1.assigned()['events'].len == 2
+
+	// second member joins: coordinator bumps the generation; g1's next
+	// heartbeat sees REBALANCE_IN_PROGRESS and rejoins; leader rebalances
+	mut g2 := c.new_group_consumer('team', ['events'], fast) or {
+		assert false, '${err}'
+		return
+	}
+	// g2's first join blocks in sync until g1 rejoins and (as leader)
+	// submits assignments — drive both from this thread: spawn g2's poll
+	done := chan bool{cap: 1}
+	spawn fn (mut g2 GroupConsumer, done chan bool) {
+		g2.poll() or {}
+		done <- true
+	}(mut g2, done)
+
+	mut settled := false
+	for _ in 0 .. 100 {
+		time.sleep(40 * time.millisecond)
+		g1.poll() or {
+			assert false, 'g1 poll during rebalance: ${err}'
+			return
+		}
+		if g1.assigned()['events'].len == 1 {
+			settled = true
+			break
+		}
+	}
+	assert settled, 'rebalance never settled'
+	_ := <-done
+	assert g2.assigned()['events'].len == 1
+	// disjoint, covering split
+	p1 := g1.assigned()['events'][0]
+	p2 := g2.assigned()['events'][0]
+	assert p1 != p2
+	assert (p1 == 0 && p2 == 1) || (p1 == 1 && p2 == 0)
+
+	// records to each partition arrive at exactly one member
+	mut records := [
+		kfake.Record{
+			partition: 0
+			value:     'to-p0'.bytes()
+		},
+		kfake.Record{
+			partition: 1
+			value:     'to-p1'.bytes()
+		},
+	]
+	c.produce('events', mut records) or {
+		assert false, '${err}'
+		return
+	}
+	mut got1 := []kfake.Record{}
+	mut got2 := []kfake.Record{}
+	for _ in 0 .. 40 {
+		got1 << g1.poll() or {
+			assert false, '${err}'
+			return
+		}
+		got2 << g2.poll() or {
+			assert false, '${err}'
+			return
+		}
+		if got1.len + got2.len >= 2 {
+			break
+		}
+		time.sleep(20 * time.millisecond)
+	}
+	assert got1.len == 1
+	assert got2.len == 1
+	assert got1[0].partition == p1
+	assert got2[0].partition == p2
+
+	// one member leaves: the survivor reclaims both partitions
+	g2.close()
+	mut reclaimed := false
+	for _ in 0 .. 100 {
+		time.sleep(40 * time.millisecond)
+		g1.poll() or {
+			assert false, '${err}'
+			return
+		}
+		if g1.assigned()['events'].len == 2 {
+			reclaimed = true
+			break
+		}
+	}
+	assert reclaimed, 'survivor never reclaimed both partitions'
+	g1.close()
+}

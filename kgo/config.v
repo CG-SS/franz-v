@@ -32,6 +32,21 @@ pub mut:
 	produce_timeout time.Duration = 10 * time.second
 	// partitioner assigns partitions to records that do not pin one.
 	partitioner kversion.Partitioner = kversion.Partitioner(kversion.KafkaPartitioner{})
+	// fetch_max_wait bounds how long the broker may hold a fetch waiting
+	// for fetch_min_bytes of data.
+	fetch_max_wait time.Duration = 1 * time.second
+	// fetch_min_bytes is the least data a broker should return per fetch.
+	fetch_min_bytes int = 1
+	// fetch_max_bytes bounds one fetch response.
+	fetch_max_bytes int = 50 << 20
+	// fetch_partition_max_bytes bounds one partition within a fetch.
+	fetch_partition_max_bytes int = 1 << 20
+	// offset_reset is where a consumer resumes when its offset is out of
+	// range (compacted/truncated away).
+	offset_reset kversion.StartOffset = .earliest
+	// isolation_level: read_committed hides records of open and aborted
+	// transactions.
+	isolation_level kversion.IsolationLevel = .read_uncommitted
 	// request_retries is how many times a retriable request failure is
 	// retried (with backoff) before surfacing the error.
 	request_retries int = 3

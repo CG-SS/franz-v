@@ -189,5 +189,70 @@ fn main() {
 		}
 		println('  fetched back and verified: keys, values, headers, null-ness, offsets')
 	}
-	println('ALL OK: produce + raw fetch verified for ${codecs.len} codecs')
+	// ------------------------------------------------------------------
+	// Consumer API: consume everything just produced across all topics
+	// ------------------------------------------------------------------
+	topics := codecs.map('franzv-smoke-${it}')
+	mut co := c.new_consumer(topics, krec.ConsumerOpts{}) or {
+		fail('new_consumer: ${err.msg()}')
+		return
+	}
+	mut consumed := []krec.Record{}
+	// poll until a quiet round (offsets resolved via ListOffsets earliest)
+	for _ in 0 .. 10 {
+		recs := co.poll() or {
+			fail('poll: ${err.msg()}')
+			return
+		}
+		if recs.len == 0 && consumed.len >= 3 * codecs.len {
+			break
+		}
+		consumed << recs
+	}
+	if consumed.len < 3 * codecs.len {
+		fail('consumer: got ${consumed.len} records, want >= ${3 * codecs.len}')
+	}
+	mut per_topic := map[string]int{}
+	for r in consumed {
+		per_topic[r.topic]++
+	}
+	for topic in topics {
+		if per_topic[topic] < 3 {
+			fail('consumer: topic ${topic} yielded ${per_topic[topic]} records')
+		}
+	}
+	println('- consumer: polled ${consumed.len} records across ${per_topic.len} topics (ListOffsets earliest)')
+
+	// incremental consumption: newly produced records arrive on next poll
+	mut extra := [
+		krec.Record{
+			value: 'post-consumer record'.bytes()
+		},
+	]
+	c.cfg.compression = .uncompressed
+	c.produce(topics[0], mut extra) or {
+		fail('incremental produce: ${err.msg()}')
+		return
+	}
+	mut got_extra := false
+	for _ in 0 .. 10 {
+		recs := co.poll() or {
+			fail('incremental poll: ${err.msg()}')
+			return
+		}
+		for r in recs {
+			v := r.value or { []u8{} }
+			if v.bytestr() == 'post-consumer record' && r.offset == extra[0].offset {
+				got_extra = true
+			}
+		}
+		if got_extra {
+			break
+		}
+	}
+	if !got_extra {
+		fail('consumer: incremental record never arrived')
+	}
+	println('- consumer: incremental record arrived at offset ${extra[0].offset}')
+	println('ALL OK: produce + raw fetch + consumer verified for ${codecs.len} codecs')
 }

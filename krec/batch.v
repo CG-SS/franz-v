@@ -24,6 +24,12 @@ pub mut:
 	producer_id    i64 = -1
 	producer_epoch i16 = -1
 	base_sequence  int = -1
+	// transactional sets attribute bit 4: the batch belongs to an open
+	// transaction of producer_id/producer_epoch.
+	transactional bool
+	// control sets attribute bit 5: the batch carries a transaction
+	// marker rather than user records.
+	control bool
 }
 
 // build_record_batch renders records into one magic-2 RecordBatch. All
@@ -50,7 +56,7 @@ pub fn build_record_batch(records []Record, opts BatchOpts) ![]u8 {
 		partition_leader_epoch: -1
 		magic:                  2
 		crc:                    0 // patched below
-		attributes:             i16(int(opts.codec))
+		attributes:             batch_attributes(opts)
 		last_offset_delta:      records.len - 1
 		first_timestamp:        base_ts
 		max_timestamp:          max_ts
@@ -70,6 +76,90 @@ pub fn build_record_batch(records []Record, opts BatchOpts) ![]u8 {
 		w.buf[batch_header_before_crc + i] = cw.buf[i]
 	}
 	return w.buf
+}
+
+fn batch_attributes(opts BatchOpts) i16 {
+	mut a := i16(int(opts.codec))
+	if opts.transactional {
+		a |= i16(0x10)
+	}
+	if opts.control {
+		a |= i16(0x20)
+	}
+	return a
+}
+
+// is_transactional reports attribute bit 4 of a parsed batch.
+pub fn is_transactional(batch RecordBatch) bool {
+	return int(batch.attributes) & (1 << 4) != 0
+}
+
+// is_control reports attribute bit 5 of a parsed batch: a transaction
+// marker batch.
+pub fn is_control(batch RecordBatch) bool {
+	return int(batch.attributes) & (1 << 5) != 0
+}
+
+// ParsedBatch is one decoded batch with its metadata preserved, for
+// callers that need transactional context (isolation filtering).
+pub struct ParsedBatch {
+pub mut:
+	batch   kmsg.RecordBatch
+	records []kmsg.Record
+}
+
+// parse_batches_meta splits and parses a Fetch payload into batches with
+// metadata. A trailing partial batch is ignored, per protocol.
+pub fn parse_batches_meta(buf []u8) ![]ParsedBatch {
+	mut out := []kmsg.ParsedBatch{}
+	mut off := 0
+	for buf.len - off >= 12 {
+		mut hr := kmsg.Reader{
+			src: buf[off + 8..off + 12].clone()
+		}
+		total := 12 + hr.read_int32()
+		if total <= 12 || off + total > buf.len {
+			break
+		}
+		batch, recs := parse_record_batch(buf[off..off + total].clone())!
+		out << kmsg.ParsedBatch{
+			batch:   batch
+			records: recs
+		}
+		off += total
+	}
+	return out
+}
+
+// control_marker_batch builds a transaction control batch holding one
+// commit (true) or abort (false) marker, as brokers write on EndTxn.
+pub fn control_marker_batch(base_offset i64, producer_id i64, producer_epoch i16, commit bool, timestamp i64) ![]u8 {
+	marker_type := if commit { u8(1) } else { u8(0) }
+	// key: version int16 0, type int16; value: version int16 0,
+	// coordinator epoch int32 0
+	key := [u8(0), 0, 0, marker_type]
+	value := [u8(0), 0, 0, 0, 0, 0]
+	rec := kmsg.Record{
+		key:       key
+		value:     value
+		timestamp: timestamp
+	}
+	return build_record_batch([rec], kmsg.BatchOpts{
+		base_offset:    base_offset
+		producer_id:    producer_id
+		producer_epoch: producer_epoch
+		transactional:  true
+		control:        true
+	})
+}
+
+// control_marker_is_commit decodes a control record's marker type.
+pub fn control_marker_is_commit(rec Record) ?bool {
+	key := rec.key or { return none }
+	if key.len < 4 {
+		return none
+	}
+	return key[2] == 0 && key[3] == 1
 }
 
 // BatchCrcError reports a record batch whose CRC-32C did not match.
@@ -131,22 +221,15 @@ pub fn parse_record_batch(buf []u8) !(RecordBatch, []Record) {
 }
 
 // parse_record_batches splits and parses a Fetch payload of one or more
-// concatenated record batches. A trailing partial batch (brokers may cut
-// responses mid-batch) is ignored, per protocol.
+// concatenated record batches, skipping control batches. A trailing
+// partial batch (brokers may cut responses mid-batch) is ignored.
 pub fn parse_record_batches(buf []u8) ![]Record {
 	mut out := []kmsg.Record{}
-	mut off := 0
-	for buf.len - off >= 12 {
-		mut hr := kmsg.Reader{
-			src: buf[off + 8..off + 12].clone()
+	for pb in parse_batches_meta(buf)! {
+		if is_control(pb.batch) {
+			continue
 		}
-		total := 12 + hr.read_int32()
-		if total <= 12 || off + total > buf.len {
-			break // partial trailing batch
-		}
-		_, recs := parse_record_batch(buf[off..off + total])!
-		out << recs
-		off += total
+		out << pb.records
 	}
 	return out
 }
