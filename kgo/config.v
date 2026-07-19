@@ -23,6 +23,15 @@ pub mut:
 	// retry_backoff_min/max bound the retry backoff schedule.
 	retry_backoff_min time.Duration = 250 * time.millisecond
 	retry_backoff_max time.Duration = 2500 * time.millisecond
+	// compression selects the codec for produced record batches.
+	compression kversion.Codec = .uncompressed
+	// required_acks for produce: -1 waits for all in-sync replicas,
+	// 1 for the leader only, 0 for no acknowledgment.
+	required_acks i16 = -1
+	// produce_timeout is the broker-side timeout for produce requests.
+	produce_timeout time.Duration = 10 * time.second
+	// partitioner assigns partitions to records that do not pin one.
+	partitioner kversion.Partitioner = kversion.Partitioner(kversion.KafkaPartitioner{})
 	// request_retries is how many times a retriable request failure is
 	// retried (with backoff) before surfacing the error.
 	request_retries int = 3
