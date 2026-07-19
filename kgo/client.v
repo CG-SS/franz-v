@@ -221,16 +221,23 @@ fn (c &Client) choose_version(req Request, broker_vs Versions) !i16 {
 
 // request_on issues req on one specific broker, negotiating versions as
 // needed and setting req.version to the chosen version.
-fn (mut c Client) request_on(mut b Broker, mut req Request) PromisedResp {
+// cap, when >= 0, bounds the negotiated version (used e.g. to stay on
+// name-addressed Produce until topic-id resolution is implemented).
+fn (mut c Client) request_on(mut b Broker, mut req Request, cap i16) PromisedResp {
 	vs := c.versions_for(mut b) or {
 		return kversion.PromisedResp{
 			err_msg:   err.msg()
 			retriable: is_retriable_err(err) || err.msg().contains('connection')
 		}
 	}
-	ver := c.choose_version(req, vs) or { return kversion.PromisedResp{
-		err_msg: err.msg()
-	} }
+	mut ver := c.choose_version(req, vs) or {
+		return kversion.PromisedResp{
+			err_msg: err.msg()
+		}
+	}
+	if cap >= 0 && ver > cap {
+		ver = cap
+	}
 	req.version = ver
 	return b.promise(req)
 }
@@ -243,7 +250,7 @@ pub fn (mut c Client) request(mut req Request) ![]u8 {
 	mut attempt := 0
 	for {
 		mut b := c.any_broker() or { return kversion.NoBrokersError{} }
-		res := c.request_on(mut b, mut req)
+		res := c.request_on(mut b, mut req, -1)
 		if body := res.body {
 			return body
 		}
@@ -263,10 +270,16 @@ pub fn (mut c Client) request(mut req Request) ![]u8 {
 // request_broker issues req against one specific broker node, retrying
 // retriable failures on that same broker.
 pub fn (mut c Client) request_broker(node_id int, mut req Request) ![]u8 {
+	return c.request_broker_capped(node_id, mut req, -1)
+}
+
+// request_broker_capped is request_broker with an upper bound on the
+// negotiated version (cap < 0 means uncapped).
+pub fn (mut c Client) request_broker_capped(node_id int, mut req Request, cap i16) ![]u8 {
 	mut attempt := 0
 	for {
 		mut b := c.broker_by_node(node_id) or { return error('unknown broker node ${node_id}') }
-		res := c.request_on(mut b, mut req)
+		res := c.request_on(mut b, mut req, cap)
 		if body := res.body {
 			return body
 		}

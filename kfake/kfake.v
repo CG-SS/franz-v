@@ -17,6 +17,7 @@ pub mut:
 	// advertised maps API key -> max version advertised via ApiVersions.
 	advertised map[i16]i16 = {
 		i16(0):  i16(9)
+		i16(1):  i16(12)
 		i16(3):  i16(12)
 		i16(18): i16(3)
 	}
@@ -152,7 +153,7 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 		corr := r.read_int32()
 		r.read_nullable_string() or { '' }
 		flexible := (key == 18 && version >= 3) || (key == 3 && version >= 9)
-			|| (key == 0 && version >= 9)
+			|| (key == 0 && version >= 9) || (key == 1 && version >= 12)
 		if flexible {
 			num_tags := r.read_uvarint()
 			for _ in 0 .. num_tags {
@@ -167,6 +168,7 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			18 { cl.answer_api_versions(body, version) }
 			3 { cl.answer_metadata(node_id, body, version) }
 			0 { cl.answer_produce(body, version) }
+			1 { cl.answer_fetch(body, version) }
 			else { []u8{} }
 		}
 
@@ -308,6 +310,54 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 				partition:   p.partition
 				error_code:  code
 				base_offset: base_offset
+			}
+		}
+		resp.topics << resp_topic
+	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+// answer_fetch re-serves stored records from the requested offset as a
+// freshly built record batch.
+fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
+	mut req := kmsg.FetchRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+
+	mut resp := kmsg.FetchResponse{
+		version: version
+	}
+	for t in req.topics {
+		mut resp_topic := kmsg.FetchResponseTopic{
+			topic: t.topic
+		}
+		for p in t.partitions {
+			skey := '${t.topic}/${p.partition}'
+			cl.mu.lock()
+			all := cl.stored[skey].clone()
+			cl.mu.unlock()
+			high := i64(all.len)
+			from := p.fetch_offset
+			mut batches := ?[]u8(none)
+			if from >= 0 && from < high {
+				serve := all[from..].clone()
+				batch := kmsg.build_record_batch(serve, kmsg.BatchOpts{
+					base_offset: from
+				}) or { continue }
+				batches = batch.clone()
+			} else {
+				batches = []u8{}
+			}
+			resp_topic.partitions << kmsg.FetchResponseTopicPartition{
+				partition:      p.partition
+				high_watermark: high
+				record_batches: batches
 			}
 		}
 		resp.topics << resp_topic

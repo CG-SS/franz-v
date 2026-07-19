@@ -102,7 +102,9 @@ fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, 
 	}
 	req.topics = [req_topic]
 
-	body := c.request_broker(leader, mut req)!
+	// Produce v13+ addresses topics by uuid (KIP-516); stay on v12 (names)
+	// until topic-id resolution is implemented in the consumer phase.
+	body := c.request_broker_capped(leader, mut req, 12)!
 	mut resp := kerr.ProduceResponse{
 		version: req.version
 	}

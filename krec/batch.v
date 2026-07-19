@@ -20,6 +20,7 @@ const batch_len_after_length_field = 49
 pub struct BatchOpts {
 pub mut:
 	codec          kmsg.Codec
+	base_offset    i64 // the batch's first offset (brokers rewrite on produce)
 	producer_id    i64 = -1
 	producer_epoch i16 = -1
 	base_sequence  int = -1
@@ -44,7 +45,7 @@ pub fn build_record_batch(records []Record, opts BatchOpts) ![]u8 {
 	compressed := compress_payload(opts.codec, payload.buf)!
 
 	mut batch := kmsg.RecordBatch{
-		first_offset:           0
+		first_offset:           opts.base_offset
 		length:                 batch_len_after_length_field + compressed.len
 		partition_leader_epoch: -1
 		magic:                  2
@@ -127,4 +128,25 @@ pub fn parse_record_batch(buf []u8) !(RecordBatch, []Record) {
 		return error('record batch has ${pr.remaining()} trailing bytes')
 	}
 	return batch, records
+}
+
+// parse_record_batches splits and parses a Fetch payload of one or more
+// concatenated record batches. A trailing partial batch (brokers may cut
+// responses mid-batch) is ignored, per protocol.
+pub fn parse_record_batches(buf []u8) ![]Record {
+	mut out := []kmsg.Record{}
+	mut off := 0
+	for buf.len - off >= 12 {
+		mut hr := kmsg.Reader{
+			src: buf[off + 8..off + 12].clone()
+		}
+		total := 12 + hr.read_int32()
+		if total <= 12 || off + total > buf.len {
+			break // partial trailing batch
+		}
+		_, recs := parse_record_batch(buf[off..off + total])!
+		out << recs
+		off += total
+	}
+	return out
 }
