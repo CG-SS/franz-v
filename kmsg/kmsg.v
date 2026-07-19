@@ -34,33 +34,34 @@ pub mut:
 	data []u8
 }
 
-// Request is implemented by all generated *Request types.
+// Request is implemented by all generated *Request types. The version
+// field is mutable through the interface so the client can negotiate it.
 pub interface Request {
-	version i16
 	key() i16
 	max_version() i16
 	is_flexible() bool
-	write_to(mut w kbin.Writer)
+	write_to(mut w Writer)
 mut:
-	read_from(mut r kbin.Reader) !
+	version i16
+	read_from(mut r Reader) !
 }
 
 // Response is implemented by all generated *Response types. A response's
 // version must be set to the version of the request that produced it before
 // calling read_from.
 pub interface Response {
-	version i16
 	key() i16
 	max_version() i16
 	is_flexible() bool
-	write_to(mut w kbin.Writer)
+	write_to(mut w Writer)
 mut:
-	read_from(mut r kbin.Reader) !
+	version i16
+	read_from(mut r Reader) !
 }
 
 // write_unknown_tags appends preserved unknown tags to w. Generated code
 // calls this at the end of each flexible tag section.
-pub fn write_unknown_tags(mut w kbin.Writer, tags []UnknownTag) {
+pub fn write_unknown_tags(mut w Writer, tags []UnknownTag) {
 	for t in tags {
 		w.write_uvarint(t.tag)
 		w.write_uvarint(u32(t.data.len))

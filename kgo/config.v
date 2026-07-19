@@ -23,14 +23,17 @@ pub mut:
 	// retry_backoff_min/max bound the retry backoff schedule.
 	retry_backoff_min time.Duration = 250 * time.millisecond
 	retry_backoff_max time.Duration = 2500 * time.millisecond
+	// request_retries is how many times a retriable request failure is
+	// retried (with backoff) before surfacing the error.
+	request_retries int = 3
 	// max_response_bytes guards frame reads from broken peers.
 	max_response_bytes int = 100 << 20
 	// max_versions caps the request versions the client will use.
 	max_versions kversion.Versions = kversion.stable()
 	// logger receives client logs; silent by default.
-	logger Logger = Logger(NopLogger{})
+	logger kversion.Logger = kversion.Logger(kversion.NopLogger{})
 	// hooks observe client internals.
-	hooks Hooks
+	hooks kversion.Hooks
 }
 
 // validate returns an error if the configuration is unusable.
