@@ -71,7 +71,7 @@ pub fn (mut c Client) new_consumer(topics []string, opts ConsumerOpts) !&Consume
 
 // list_offsets resolves offsets for partitions of one topic on one leader;
 // ts is -2 for earliest, -1 for latest.
-fn (mut c Client) list_offsets(leader int, topic string, partitions []int, ts i64) !map[int]i64 {
+pub fn (mut c Client) list_offsets(leader int, topic string, partitions []int, ts i64) !map[int]i64 {
 	mut req := krec.ListOffsetsRequest{
 		replica_id: -1
 		topics:     [

@@ -28,12 +28,21 @@ pub mut:
 		i16(12): i16(3)
 		i16(13): i16(2)
 		i16(14): i16(3)
+		i16(15): i16(4)
+		i16(16): i16(4)
 		i16(18): i16(3)
+		i16(19): i16(5)
+		i16(20): i16(3)
+		i16(21): i16(1)
 		i16(22): i16(4)
 		i16(24): i16(3)
 		i16(25): i16(3)
 		i16(26): i16(3)
 		i16(28): i16(3)
+		i16(32): i16(3)
+		i16(37): i16(1)
+		i16(42): i16(1)
+		i16(44): i16(0)
 	}
 	// api_versions_max caps the ApiVersions request version accepted;
 	// higher requests get a v0-encoded UNSUPPORTED_VERSION reply
@@ -77,6 +86,9 @@ mut:
 	aborted     map[string][]kmsg.AbortedRange // 'topic/partition' -> aborted ranges
 	open_txn    map[string]i64                 // 'topic/partition/pid' -> open txn first offset
 	next_pid    i64 = 1000
+	topics      map[string]int               // topic -> partition count (registry)
+	tconfigs    map[string]map[string]string // topic -> configs
+	log_start   map[string]i64               // 'topic/partition' -> log start offset
 	topic_uuids map[string][16]u8
 	uuid_names  map[string]string
 }
@@ -207,7 +219,8 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			|| (key == 2 && version >= 6) || (key == 8 && version >= 8)
 			|| (key == 22 && version >= 2) || (key == 24 && version >= 3)
 			|| (key == 25 && version >= 3) || (key == 26 && version >= 3)
-			|| (key == 28 && version >= 3)
+			|| (key == 28 && version >= 3) || (key == 16 && version >= 3)
+			|| (key == 19 && version >= 5)
 		if flexible {
 			num_tags := r.read_uvarint()
 			for _ in 0 .. num_tags {
@@ -239,6 +252,15 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			25 { cl.answer_add_offsets_to_txn(body, version) }
 			26 { cl.answer_end_txn(body, version) }
 			28 { cl.answer_txn_offset_commit(body, version) }
+			15 { cl.answer_describe_groups(body, version) }
+			16 { cl.answer_list_groups(body, version) }
+			19 { cl.answer_create_topics(body, version) }
+			20 { cl.answer_delete_topics(body, version) }
+			21 { cl.answer_delete_records(body, version) }
+			32 { cl.answer_describe_configs(body, version) }
+			37 { cl.answer_create_partitions(body, version) }
+			42 { cl.answer_delete_groups(body, version) }
+			44 { cl.answer_incremental_alter_configs(body, version) }
 			else { []u8{} }
 		}
 
@@ -304,7 +326,16 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
-	req_topics := req.topics or { []kmsg.MetadataRequestTopic{} }
+	mut req_topics := (req.topics or {
+		// null topics = all known topics
+		cl.mu.lock()
+		mut names := cl.topics.keys()
+		names.sort()
+		cl.mu.unlock()
+		names.map(kmsg.MetadataRequestTopic{
+			topic: it
+		})
+	}).clone()
 
 	mut resp := kmsg.MetadataResponse{
 		version:       version
@@ -315,9 +346,13 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 		tname0 := t.topic or { '' }
 		cl.mu.lock()
 		tid := cl.uuid_for(tname0)
+		if tname0 !in cl.topics {
+			cl.topics[tname0] = cl.cfg.partitions_per_topic // auto-create
+		}
+		nparts := cl.topics[tname0]
 		cl.mu.unlock()
 		mut partitions := []kmsg.MetadataResponseTopicPartition{}
-		for p in 0 .. cl.cfg.partitions_per_topic {
+		for p in 0 .. nparts {
 			partitions << kmsg.MetadataResponseTopicPartition{
 				partition: p
 				leader:    p % cl.nodes
@@ -469,8 +504,11 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 			aborted_ranges := cl.aborted[skey].clone()
 			cl.mu.unlock()
 			high := partition_high(batches)
+			cl.mu.lock()
+			lstart := cl.log_start[skey] or { i64(0) }
+			cl.mu.unlock()
 			from := p.fetch_offset
-			if from < 0 || from > high {
+			if from < lstart || from > high {
 				resp_topic.partitions << kmsg.FetchResponseTopicPartition{
 					partition:      p.partition
 					error_code:     1 // OFFSET_OUT_OF_RANGE
@@ -480,7 +518,7 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 			}
 			mut payload := []u8{}
 			for b in batches {
-				if b.end_offset() <= from {
+				if b.end_offset() <= from || b.end_offset() <= lstart {
 					continue
 				}
 				rebuilt := if b.control {
@@ -546,8 +584,9 @@ fn (mut cl Cluster) answer_list_offsets(body []u8, version i16) []u8 {
 		for p in t.partitions {
 			cl.mu.lock()
 			high := partition_high(cl.stored['${t.topic}/${p.partition}'])
+			lstart := cl.log_start['${t.topic}/${p.partition}'] or { i64(0) }
 			cl.mu.unlock()
-			off := if p.timestamp == -2 { i64(0) } else { high }
+			off := if p.timestamp == -2 { lstart } else { high }
 			resp_topic.partitions << kmsg.ListOffsetsResponseTopicPartition{
 				partition: p.partition
 				offset:    off
@@ -927,9 +966,29 @@ fn (mut cl Cluster) answer_offset_fetch(body []u8, version i16) []u8 {
 	mut resp := kmsg.OffsetFetchResponse{
 		version: version
 	}
-	req_topics := req.topics or { []kmsg.OffsetFetchRequestTopic{} }
 	cl.mu.lock()
 	mut g := cl.group(req.group)
+	req_topics := req.topics or {
+		// null topics = every partition the group has offsets for
+		mut per_topic := map[string][]int{}
+		mut okeys := g.offsets.keys()
+		okeys.sort()
+		for key in okeys {
+			idx := key.last_index('/') or { continue }
+			per_topic[key[..idx]] << key[idx + 1..].int()
+		}
+		mut all := []kmsg.OffsetFetchRequestTopic{}
+		mut tnames := per_topic.keys()
+		tnames.sort()
+		for tname in tnames {
+			all << kmsg.OffsetFetchRequestTopic{
+				topic:      tname
+				partitions: per_topic[tname]
+			}
+		}
+		all
+	}
+
 	for t in req_topics {
 		mut rt := kmsg.OffsetFetchResponseTopic{
 			topic: t.topic
@@ -1160,6 +1219,350 @@ fn (mut cl Cluster) answer_end_txn(body []u8, version i16) []u8 {
 		version:    version
 		error_code: code
 	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+// ---------------------------------------------------------------------------
+// Admin APIs: topic lifecycle, configs, group listing/description/deletion,
+// record deletion.
+// ---------------------------------------------------------------------------
+
+fn (mut cl Cluster) answer_create_topics(body []u8, version i16) []u8 {
+	mut req := kmsg.CreateTopicsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.CreateTopicsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for t in req.topics {
+		mut code := i16(0)
+		if t.topic in cl.topics {
+			code = 36 // TOPIC_ALREADY_EXISTS
+		} else {
+			nparts := if t.num_partitions > 0 { t.num_partitions } else { 1 }
+			cl.topics[t.topic] = nparts
+			cl.uuid_for(t.topic)
+			mut cfgs := map[string]string{}
+			for c in t.configs {
+				cfgs[c.name] = c.value or { '' }
+			}
+			cl.tconfigs[t.topic] = cfgs.move()
+		}
+		resp.topics << kmsg.CreateTopicsResponseTopic{
+			topic:      t.topic
+			error_code: code
+		}
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_delete_topics(body []u8, version i16) []u8 {
+	mut req := kmsg.DeleteTopicsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.DeleteTopicsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for name in req.topic_names {
+		mut code := i16(0)
+		if name !in cl.topics {
+			code = 3 // UNKNOWN_TOPIC_OR_PARTITION
+		} else {
+			nparts := cl.topics[name]
+			cl.topics.delete(name)
+			cl.tconfigs.delete(name)
+			for p in 0 .. nparts {
+				cl.stored.delete('${name}/${p}')
+				cl.log_start.delete('${name}/${p}')
+				cl.aborted.delete('${name}/${p}')
+			}
+		}
+		resp.topics << kmsg.DeleteTopicsResponseTopic{
+			topic:      name
+			error_code: code
+		}
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_create_partitions(body []u8, version i16) []u8 {
+	mut req := kmsg.CreatePartitionsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.CreatePartitionsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for t in req.topics {
+		mut code := i16(0)
+		if t.topic !in cl.topics {
+			code = 3
+		} else if t.count <= cl.topics[t.topic] {
+			code = 37 // INVALID_PARTITIONS
+		} else {
+			cl.topics[t.topic] = t.count
+		}
+		resp.topics << kmsg.CreatePartitionsResponseTopic{
+			topic:      t.topic
+			error_code: code
+		}
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_describe_configs(body []u8, version i16) []u8 {
+	mut req := kmsg.DescribeConfigsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.DescribeConfigsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for res in req.resources {
+		mut rr := kmsg.DescribeConfigsResponseResource{
+			resource_type: res.resource_type
+			resource_name: res.resource_name
+		}
+		if res.resource_type == 2 { // topic
+			if res.resource_name !in cl.topics {
+				rr.error_code = 3
+			} else {
+				// one default entry every topic has, plus explicit ones
+				rr.configs << kmsg.DescribeConfigsResponseResourceConfig{
+					name:       'cleanup.policy'
+					value:      cl.tconfigs[res.resource_name]['cleanup.policy'] or { 'delete' }
+					is_default: 'cleanup.policy' !in cl.tconfigs[res.resource_name]
+				}
+				mut names := cl.tconfigs[res.resource_name].keys()
+				names.sort()
+				for name in names {
+					if name == 'cleanup.policy' {
+						continue
+					}
+					rr.configs << kmsg.DescribeConfigsResponseResourceConfig{
+						name:  name
+						value: cl.tconfigs[res.resource_name][name]
+					}
+				}
+			}
+		}
+		resp.resources << rr
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_incremental_alter_configs(body []u8, version i16) []u8 {
+	mut req := kmsg.IncrementalAlterConfigsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.IncrementalAlterConfigsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for res in req.resources {
+		mut code := i16(0)
+		if res.resource_type != 2 || res.resource_name !in cl.topics {
+			code = 3
+		} else {
+			if res.resource_name !in cl.tconfigs {
+				cl.tconfigs[res.resource_name] = map[string]string{}
+			}
+			for c in res.configs {
+				match i8(c.op) {
+					0 { cl.tconfigs[res.resource_name][c.name] = c.value or { '' } }
+					1 { cl.tconfigs[res.resource_name].delete(c.name) }
+					else { code = 44 } // INVALID_CONFIG
+				}
+			}
+		}
+		resp.resources << kmsg.IncrementalAlterConfigsResponseResource{
+			resource_type: res.resource_type
+			resource_name: res.resource_name
+			error_code:    code
+		}
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_list_groups(body []u8, version i16) []u8 {
+	mut resp := kmsg.ListGroupsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	mut names := cl.groups.keys()
+	names.sort()
+	for name in names {
+		g := cl.groups[name] or { continue }
+		state := if g.members.len == 0 { 'Empty' } else { 'Stable' }
+		resp.groups << kmsg.ListGroupsResponseGroup{
+			group:         name
+			protocol_type: 'consumer'
+			group_state:   state
+		}
+	}
+	cl.mu.unlock()
+	_ = body
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_describe_groups(body []u8, version i16) []u8 {
+	mut req := kmsg.DescribeGroupsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.DescribeGroupsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for name in req.groups {
+		mut rg := kmsg.DescribeGroupsResponseGroup{
+			group:         name
+			protocol_type: 'consumer'
+		}
+		if name !in cl.groups {
+			rg.state = 'Dead'
+		} else {
+			g := cl.groups[name] or { continue }
+			rg.state = if g.members.len == 0 { 'Empty' } else { 'Stable' }
+			rg.protocol = g.protocol
+			mut ids := g.members.keys()
+			ids.sort()
+			for id in ids {
+				rg.members << kmsg.DescribeGroupsResponseGroupMember{
+					member_id:         id
+					client_id:         'franz-v'
+					client_host:       '/127.0.0.1'
+					protocol_metadata: g.members[id].metadata.clone()
+					member_assignment: g.assignments[id] or { []u8{} }.clone()
+				}
+			}
+		}
+		resp.groups << rg
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_delete_groups(body []u8, version i16) []u8 {
+	mut req := kmsg.DeleteGroupsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.DeleteGroupsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for name in req.groups {
+		mut code := i16(0)
+		if name !in cl.groups {
+			code = 69 // GROUP_ID_NOT_FOUND
+		} else {
+			g := cl.groups[name] or { continue }
+			if g.members.len > 0 {
+				code = 68 // NON_EMPTY_GROUP
+			} else {
+				cl.groups.delete(name)
+			}
+		}
+		resp.groups << kmsg.DeleteGroupsResponseGroup{
+			group:      name
+			error_code: code
+		}
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_delete_records(body []u8, version i16) []u8 {
+	mut req := kmsg.DeleteRecordsRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	mut resp := kmsg.DeleteRecordsResponse{
+		version: version
+	}
+	cl.mu.lock()
+	for t in req.topics {
+		mut rt := kmsg.DeleteRecordsResponseTopic{
+			topic: t.topic
+		}
+		for p in t.partitions {
+			skey := '${t.topic}/${p.partition}'
+			high := partition_high(cl.stored[skey])
+			mut code := i16(0)
+			mut low := i64(-1)
+			if p.offset < 0 || p.offset > high {
+				code = 1 // OFFSET_OUT_OF_RANGE
+			} else {
+				cur := cl.log_start[skey] or { i64(0) }
+				if p.offset > cur {
+					cl.log_start[skey] = p.offset
+				}
+				low = cl.log_start[skey] or { i64(0) }
+			}
+			rt.partitions << kmsg.DeleteRecordsResponseTopicPartition{
+				partition:     p.partition
+				low_watermark: low
+				error_code:    code
+			}
+		}
+		resp.topics << rt
+	}
+	cl.mu.unlock()
 	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
