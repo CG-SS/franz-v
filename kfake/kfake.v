@@ -29,6 +29,11 @@ pub mut:
 		i16(13): i16(2)
 		i16(14): i16(3)
 		i16(18): i16(3)
+		i16(22): i16(4)
+		i16(24): i16(3)
+		i16(25): i16(3)
+		i16(26): i16(3)
+		i16(28): i16(3)
 	}
 	// api_versions_max caps the ApiVersions request version accepted;
 	// higher requests get a v0-encoded UNSUPPORTED_VERSION reply
@@ -62,10 +67,16 @@ pub mut:
 mut:
 	mu          &sync.Mutex = sync.new_mutex()
 	fails       int
-	conns       map[int]int              // node -> connections accepted
-	stored      map[string][]kmsg.Record // 'topic/partition' -> records
+	conns       map[int]int                   // node -> connections accepted
+	stored      map[string][]kmsg.StoredBatch // 'topic/partition' -> batches
 	groups      map[string]&kmsg.FakeGroup
 	next_member int
+	txns        map[string]&kmsg.FakeTxn       // transactional_id -> state
+	pid_epoch   map[i64]i16                    // producer id -> current epoch (fencing)
+	seqs        map[string]int                 // 'pid/topic/partition' -> next sequence
+	aborted     map[string][]kmsg.AbortedRange // 'topic/partition' -> aborted ranges
+	open_txn    map[string]i64                 // 'topic/partition/pid' -> open txn first offset
+	next_pid    i64 = 1000
 	topic_uuids map[string][16]u8
 	uuid_names  map[string]string
 }
@@ -95,14 +106,22 @@ pub fn (cl &Cluster) seed_addr() string {
 	return '127.0.0.1:${cl.ports[0]}'
 }
 
-// records returns a copy of everything produced to topic/partition, in
-// offset order.
+// records returns a copy of every user record produced to
+// topic/partition in offset order (control markers excluded, aborted
+// records included).
 pub fn (mut cl Cluster) records(topic string, partition int) []Record {
 	cl.mu.lock()
 	defer {
 		cl.mu.unlock()
 	}
-	return cl.stored['${topic}/${partition}'].clone()
+	mut out := []kmsg.Record{}
+	for b in cl.stored['${topic}/${partition}'] {
+		if b.control {
+			continue
+		}
+		out << b.records
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +205,9 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 		flexible := (key == 18 && version >= 3) || (key == 3 && version >= 9)
 			|| (key == 0 && version >= 9) || (key == 1 && version >= 12)
 			|| (key == 2 && version >= 6) || (key == 8 && version >= 8)
+			|| (key == 22 && version >= 2) || (key == 24 && version >= 3)
+			|| (key == 25 && version >= 3) || (key == 26 && version >= 3)
+			|| (key == 28 && version >= 3)
 		if flexible {
 			num_tags := r.read_uvarint()
 			for _ in 0 .. num_tags {
@@ -212,6 +234,11 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			12 { cl.answer_heartbeat(body, version) }
 			13 { cl.answer_leave_group(body, version) }
 			14 { cl.answer_sync_group(body, version) }
+			22 { cl.answer_init_producer_id(body, version) }
+			24 { cl.answer_add_partitions_to_txn(body, version) }
+			25 { cl.answer_add_offsets_to_txn(body, version) }
+			26 { cl.answer_end_txn(body, version) }
+			28 { cl.answer_txn_offset_commit(body, version) }
 			else { []u8{} }
 		}
 
@@ -317,8 +344,8 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 }
 
 // answer_produce fully validates each produced batch (CRC, decompression,
-// record decode) before storing; a batch that fails validation answers
-// with CORRUPT_MESSAGE (2) so client tests catch encoder bugs loudly.
+// record decode) before storing; transactional batches additionally check
+// producer epoch (fencing) and sequence continuity.
 fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 	mut req := kmsg.ProduceRequest{
 		version: version
@@ -348,7 +375,7 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 			mut base_offset := i64(-1)
 			if code == 0 {
 				batch_bytes := p.records or { []u8{} }
-				_, mut recs := kmsg.parse_record_batch(batch_bytes) or {
+				meta, mut recs := kmsg.parse_record_batch(batch_bytes) or {
 					resp_topic.partitions << kmsg.ProduceResponseTopicPartition{
 						partition:  p.partition
 						error_code: 2 // CORRUPT_MESSAGE
@@ -357,12 +384,41 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 				}
 				skey := '${topic}/${p.partition}'
 				cl.mu.lock()
-				base_offset = cl.stored[skey].len
-				for mut rec in recs {
-					rec.topic = topic
-					rec.partition = p.partition
-					rec.offset += base_offset
-					cl.stored[skey] << rec
+				if meta.producer_id >= 0 {
+					cur := cl.pid_epoch[meta.producer_id] or { i16(-1) }
+					if meta.producer_epoch < cur {
+						code = 90 // PRODUCER_FENCED
+					} else if meta.first_sequence >= 0 {
+						qkey := '${meta.producer_id}/${skey}'
+						expected := cl.seqs[qkey] or { 0 }
+						if meta.first_sequence != expected {
+							code = 45 // OUT_OF_ORDER_SEQUENCE_NUMBER
+						} else {
+							cl.seqs[qkey] = expected + recs.len
+						}
+					}
+				}
+				if code == 0 {
+					base_offset = partition_high(cl.stored[skey])
+					for mut rec in recs {
+						rec.topic = topic
+						rec.partition = p.partition
+						rec.offset += base_offset
+					}
+					if kmsg.is_transactional(meta) {
+						okey := '${skey}/${meta.producer_id}'
+						if okey !in cl.open_txn {
+							cl.open_txn[okey] = base_offset
+						}
+					}
+					cl.stored[skey] << kmsg.StoredBatch{
+						base_offset:   base_offset
+						records:       recs
+						pid:           meta.producer_id
+						epoch:         meta.producer_epoch
+						base_sequence: meta.first_sequence
+						transactional: kmsg.is_transactional(meta)
+					}
 				}
 				cl.mu.unlock()
 			}
@@ -379,8 +435,9 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 	return w.buf
 }
 
-// answer_fetch re-serves stored records from the requested offset as a
-// freshly built record batch.
+// answer_fetch re-serves stored batches (including control markers) from
+// the requested offset, with the partition's aborted-transaction ranges
+// for client-side read_committed filtering.
 fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 	mut req := kmsg.FetchRequest{
 		version: version
@@ -399,18 +456,19 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 			cl.mu.unlock()
 			continue
 		}
-		tid := cl.uuid_for(tname)
+		ftid := cl.uuid_for(tname)
 		cl.mu.unlock()
 		mut resp_topic := kmsg.FetchResponseTopic{
 			topic:    tname
-			topic_id: tid
+			topic_id: ftid
 		}
 		for p in t.partitions {
 			skey := '${tname}/${p.partition}'
 			cl.mu.lock()
-			all := cl.stored[skey].clone()
+			batches := cl.stored[skey].clone()
+			aborted_ranges := cl.aborted[skey].clone()
 			cl.mu.unlock()
-			high := i64(all.len)
+			high := partition_high(batches)
 			from := p.fetch_offset
 			if from < 0 || from > high {
 				resp_topic.partitions << kmsg.FetchResponseTopicPartition{
@@ -420,20 +478,44 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 				}
 				continue
 			}
-			mut batches := ?[]u8(none)
-			if from >= 0 && from < high {
-				serve := all[from..].clone()
-				batch := kmsg.build_record_batch(serve, kmsg.BatchOpts{
-					base_offset: from
-				}) or { continue }
-				batches = batch.clone()
-			} else {
-				batches = []u8{}
+			mut payload := []u8{}
+			for b in batches {
+				if b.end_offset() <= from {
+					continue
+				}
+				rebuilt := if b.control {
+					kmsg.control_marker_batch(b.base_offset, b.pid, b.epoch, b.commit, 0) or {
+						continue
+					}
+				} else {
+					kmsg.build_record_batch(b.records, kmsg.BatchOpts{
+						base_offset:    b.base_offset
+						producer_id:    b.pid
+						producer_epoch: b.epoch
+						base_sequence:  b.base_sequence
+						transactional:  b.transactional
+					}) or { continue }
+				}
+				payload << rebuilt
+			}
+			mut aborted := []kmsg.FetchResponseTopicPartitionAbortedTransaction{}
+			for ar in aborted_ranges {
+				// only ranges whose closing marker falls inside the
+				// served window; fully-consumed aborts are irrelevant
+				if ar.marker_offset < from {
+					continue
+				}
+				aborted << kmsg.FetchResponseTopicPartitionAbortedTransaction{
+					producer_id:  ar.pid
+					first_offset: ar.first_offset
+				}
 			}
 			resp_topic.partitions << kmsg.FetchResponseTopicPartition{
-				partition:      p.partition
-				high_watermark: high
-				record_batches: batches
+				partition:            p.partition
+				high_watermark:       high
+				last_stable_offset:   high
+				record_batches:       payload
+				aborted_transactions: aborted
 			}
 		}
 		resp.topics << resp_topic
@@ -463,7 +545,7 @@ fn (mut cl Cluster) answer_list_offsets(body []u8, version i16) []u8 {
 		}
 		for p in t.partitions {
 			cl.mu.lock()
-			high := i64(cl.stored['${t.topic}/${p.partition}'].len)
+			high := partition_high(cl.stored['${t.topic}/${p.partition}'])
 			cl.mu.unlock()
 			off := if p.timestamp == -2 { i64(0) } else { high }
 			resp_topic.partitions << kmsg.ListOffsetsResponseTopicPartition{
@@ -502,6 +584,53 @@ mut:
 	assignments     map[string][]u8
 	assignments_gen int
 	offsets         map[string]i64 // 'topic/partition' -> committed
+}
+
+// StoredBatch is one appended record batch with its producer metadata,
+// so fetch can re-serve faithfully and EndTxn can write markers.
+struct StoredBatch {
+mut:
+	base_offset   i64
+	records       []kmsg.Record // empty for control batches
+	pid           i64 = -1
+	epoch         i16 = -1
+	base_sequence int = -1
+	transactional bool
+	control       bool
+	commit        bool // marker type for control batches
+}
+
+fn (b &StoredBatch) end_offset() i64 {
+	if b.control {
+		return b.base_offset + 1
+	}
+	return b.base_offset + b.records.len
+}
+
+// AbortedRange is one aborted transaction's extent in a partition; the
+// closing marker's offset bounds it, so fetches can include only ranges
+// overlapping the served window (as real brokers do).
+struct AbortedRange {
+	pid           i64
+	first_offset  i64
+	marker_offset i64
+}
+
+// FakeTxn is per-transactional-id coordinator state.
+@[heap]
+struct FakeTxn {
+mut:
+	pid        i64
+	epoch      i16
+	partitions map[string]bool           // 'topic/partition' touched this txn
+	staged     map[string]map[string]i64 // group -> 'topic/partition' -> offset
+}
+
+fn partition_high(batches []StoredBatch) i64 {
+	if batches.len == 0 {
+		return 0
+	}
+	return batches[batches.len - 1].end_offset()
 }
 
 // uuid_for assigns a deterministic non-zero uuid per topic name.
@@ -815,6 +944,222 @@ fn (mut cl Cluster) answer_offset_fetch(body []u8, version i16) []u8 {
 		resp.topics << rt
 	}
 	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+// ---------------------------------------------------------------------------
+// Transaction coordinator: InitProducerId with epoch bumps (fencing),
+// AddPartitionsToTxn, staged TxnOffsetCommit applied on commit, and
+// EndTxn writing control markers plus aborted-range bookkeeping.
+// ---------------------------------------------------------------------------
+
+fn (mut cl Cluster) txn(tid string) &FakeTxn {
+	if tid !in cl.txns {
+		cl.txns[tid] = &kmsg.FakeTxn{
+			pid:   cl.next_pid
+			epoch: -1
+		}
+		cl.next_pid++
+	}
+	return cl.txns[tid]
+}
+
+fn (mut cl Cluster) answer_init_producer_id(body []u8, version i16) []u8 {
+	mut req := kmsg.InitProducerIDRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	tid := req.transactional_id or { '' }
+
+	mut resp := kmsg.InitProducerIDResponse{
+		version: version
+	}
+	cl.mu.lock()
+	if tid == '' {
+		// plain idempotent producer: fresh pid, epoch 0
+		resp.producer_id = cl.next_pid
+		cl.next_pid++
+		cl.pid_epoch[resp.producer_id] = 0
+	} else {
+		mut t := cl.txn(tid)
+		t.epoch++ // re-init bumps the epoch: zombie fencing
+		t.partitions = map[string]bool{}
+		t.staged = map[string]map[string]i64{}
+		cl.pid_epoch[t.pid] = t.epoch
+		resp.producer_id = t.pid
+		resp.producer_epoch = t.epoch
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) txn_check(tid string, pid i64, epoch i16) i16 {
+	t := cl.txns[tid] or { return 90 }
+	if t.pid != pid {
+		return 90
+	}
+	if epoch < t.epoch {
+		return 90 // PRODUCER_FENCED
+	}
+	return 0
+}
+
+fn (mut cl Cluster) answer_add_partitions_to_txn(body []u8, version i16) []u8 {
+	mut req := kmsg.AddPartitionsToTxnRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+
+	mut resp := kmsg.AddPartitionsToTxnResponse{
+		version: version
+	}
+	cl.mu.lock()
+	code := cl.txn_check(req.transactional_id, req.producer_id, req.producer_epoch)
+	mut t := cl.txn(req.transactional_id)
+	for rt in req.topics {
+		mut resp_topic := kmsg.AddPartitionsToTxnResponseTopic{
+			topic: rt.topic
+		}
+		for p in rt.partitions {
+			if code == 0 {
+				t.partitions['${rt.topic}/${p}'] = true
+			}
+			resp_topic.partitions << kmsg.AddPartitionsToTxnResponseTopicPartition{
+				partition:  p
+				error_code: code
+			}
+		}
+		resp.topics << resp_topic
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_add_offsets_to_txn(body []u8, version i16) []u8 {
+	mut req := kmsg.AddOffsetsToTxnRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+	cl.mu.lock()
+	code := cl.txn_check(req.transactional_id, req.producer_id, req.producer_epoch)
+	cl.mu.unlock()
+	mut resp := kmsg.AddOffsetsToTxnResponse{
+		version:    version
+		error_code: code
+	}
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_txn_offset_commit(body []u8, version i16) []u8 {
+	mut req := kmsg.TxnOffsetCommitRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+
+	mut resp := kmsg.TxnOffsetCommitResponse{
+		version: version
+	}
+	cl.mu.lock()
+	code := cl.txn_check(req.transactional_id, req.producer_id, req.producer_epoch)
+	mut t := cl.txn(req.transactional_id)
+	if req.group !in t.staged {
+		t.staged[req.group] = map[string]i64{}
+	}
+	for rt in req.topics {
+		mut resp_topic := kmsg.TxnOffsetCommitResponseTopic{
+			topic: rt.topic
+		}
+		for p in rt.partitions {
+			if code == 0 {
+				t.staged[req.group]['${rt.topic}/${p.partition}'] = p.offset
+			}
+			resp_topic.partitions << kmsg.TxnOffsetCommitResponseTopicPartition{
+				partition:  p.partition
+				error_code: code
+			}
+		}
+		resp.topics << resp_topic
+	}
+	cl.mu.unlock()
+	mut w := kmsg.Writer{}
+	resp.write_to(mut w)
+	return w.buf
+}
+
+fn (mut cl Cluster) answer_end_txn(body []u8, version i16) []u8 {
+	mut req := kmsg.EndTxnRequest{
+		version: version
+	}
+	mut r := kmsg.Reader{
+		src: body
+	}
+	req.read_from(mut r) or { return []u8{} }
+
+	cl.mu.lock()
+	code := cl.txn_check(req.transactional_id, req.producer_id, req.producer_epoch)
+	if code == 0 {
+		mut t := cl.txn(req.transactional_id)
+		// write a control marker into every partition the txn touched
+		mut pkeys := t.partitions.keys()
+		pkeys.sort()
+		for pkey in pkeys {
+			base := partition_high(cl.stored[pkey])
+			cl.stored[pkey] << kmsg.StoredBatch{
+				base_offset: base
+				pid:         t.pid
+				epoch:       t.epoch
+				control:     true
+				commit:      req.commit
+			}
+			okey := '${pkey}/${t.pid}'
+			if first := cl.open_txn[okey] {
+				if !req.commit {
+					cl.aborted[pkey] << kmsg.AbortedRange{
+						pid:           t.pid
+						first_offset:  first
+						marker_offset: base
+					}
+				}
+				cl.open_txn.delete(okey)
+			}
+		}
+		if req.commit {
+			// staged group offsets become visible
+			for group, offsets in t.staged {
+				mut g := cl.group(group)
+				for key, off in offsets {
+					g.offsets[key] = off
+				}
+			}
+		}
+		t.partitions = map[string]bool{}
+		t.staged = map[string]map[string]i64{}
+	}
+	cl.mu.unlock()
+	mut resp := kmsg.EndTxnResponse{
+		version:    version
+		error_code: code
+	}
 	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
