@@ -47,6 +47,9 @@ pub mut:
 	// isolation_level: read_committed hides records of open and aborted
 	// transactions.
 	isolation_level kversion.IsolationLevel = .read_uncommitted
+	// max_inflight is the pipelining depth per broker connection: how
+	// many requests may await responses concurrently.
+	max_inflight int = 64
 	// request_retries is how many times a retriable request failure is
 	// retried (with backoff) before surfacing the error.
 	request_retries int = 3

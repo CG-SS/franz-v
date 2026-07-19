@@ -23,12 +23,14 @@ pub mut:
 	cfg    kversion.Config
 	cancel &kversion.Cancel
 mut:
-	mu       &sync.Mutex = sync.new_mutex()
-	seeds    []&kversion.Broker
-	brokers  map[int]&kversion.Broker     // node id -> discovered broker
-	versions map[string]kversion.Versions // broker addr -> negotiated versions
-	meta     ?kversion.MetadataResponse
-	rr       u32 // round-robin cursor for any_broker
+	mu          &sync.Mutex = sync.new_mutex()
+	seeds       []&kversion.Broker
+	brokers     map[int]&kversion.Broker     // node id -> discovered broker
+	versions    map[string]kversion.Versions // broker addr -> negotiated versions
+	topic_ids   map[string][16]u8            // topic name -> uuid (KIP-516)
+	names_by_id map[string]string            // uuid hex -> topic name
+	meta        ?kversion.MetadataResponse
+	rr          u32 // round-robin cursor for any_broker
 }
 
 // new_client validates cfg, starts a worker per seed broker, and returns
@@ -325,6 +327,14 @@ pub fn (mut c Client) metadata(topics []string) !MetadataResponse {
 fn (mut c Client) apply_metadata(resp MetadataResponse) {
 	c.mu.lock()
 	c.meta = resp
+	zero := [16]u8{}
+	for t in resp.topics {
+		tname := t.topic or { continue }
+		if t.topic_id != zero {
+			c.topic_ids[tname] = t.topic_id
+			c.names_by_id[t.topic_id[..].hex()] = tname
+		}
+	}
 	mut to_start := []&kversion.Broker{}
 	for br in resp.brokers {
 		if br.node_id !in c.brokers {
@@ -373,6 +383,26 @@ pub fn (mut c Client) partition_leader(topic string, partition int) ?int {
 		}
 	}
 	return none
+}
+
+// topic_id returns the KIP-516 uuid of a topic, once learned from
+// metadata; none if unknown.
+pub fn (mut c Client) topic_id(topic string) ?[16]u8 {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
+	id := c.topic_ids[topic] or { return none }
+	return id
+}
+
+// topic_by_id resolves a KIP-516 topic uuid back to its name.
+pub fn (mut c Client) topic_by_id(id [16]u8) ?string {
+	c.mu.lock()
+	defer {
+		c.mu.unlock()
+	}
+	return c.names_by_id[id[..].hex()] or { return none }
 }
 
 // known_brokers returns the node ids of all discovered brokers, sorted.

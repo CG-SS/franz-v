@@ -132,9 +132,9 @@ fn (mut g GroupConsumer) find_coordinator() ! {
 	return error('find coordinator: not available after retries')
 }
 
-// request_capped is request() with a version cap, for the shape-changing
-// group APIs.
-fn (mut c Client) request_capped(mut req Request, cap i16) ![]u8 {
+// request_capped is request() with a version cap, for shape-changing APIs
+// (coordinator lookups, raw fetches to brokers without known topic ids).
+pub fn (mut c Client) request_capped(mut req Request, cap i16) ![]u8 {
 	mut attempt := 0
 	for {
 		mut b := c.any_broker() or { return kmsg.NoBrokersError{} }
@@ -160,8 +160,17 @@ fn (mut c Client) request_capped(mut req Request, cap i16) ![]u8 {
 
 fn (g &GroupConsumer) member_metadata() []u8 {
 	mut meta := kmsg.ConsumerMemberMetadata{
-		version: 0
-		topics:  g.topics.clone()
+		version:    2 // v1 adds owned_partitions, v2 the generation
+		topics:     g.topics.clone()
+		generation: g.generation
+	}
+	mut owned_topics := g.assignment.keys()
+	owned_topics.sort()
+	for t in owned_topics {
+		meta.owned_partitions << kmsg.ConsumerMemberMetadataOwnedPartition{
+			topic:      t
+			partitions: g.assignment[t].clone()
+		}
 	}
 	mut w := kmsg.Writer{}
 	meta.write_to(mut w)
@@ -288,13 +297,48 @@ fn (mut g GroupConsumer) join_and_sync() ! {
 			src: sresp.member_assignment
 		}
 		assigned.read_from(mut ar)!
-		g.assignment = map[string][]int{}
+		mut new_assignment := map[string][]int{}
 		for t in assigned.topics {
-			g.assignment[t.topic] = t.partitions.clone()
+			new_assignment[t.topic] = t.partitions.clone()
 		}
-		c.cfg.log(.info, 'group ${g.group}: assigned ${g.assignment}')
+		c.cfg.log(.info, 'group ${g.group}: assigned ${new_assignment}')
 
-		g.position_at_committed()!
+		if chosen_name == 'cooperative-sticky' {
+			// keep cursors of retained partitions: the sticky payoff is
+			// no offset refetch and no duplicate consumption
+			mut preserve := map[string]i64{}
+			mut revoked := 0
+			if mut inner := g.inner {
+				for topic, parts in g.assignment {
+					for p in parts {
+						key := cursor_key(topic, p)
+						retained := p in (new_assignment[topic] or { []int{} })
+						if retained {
+							if cur := inner.cursors[key] {
+								preserve[key] = cur
+							}
+						} else {
+							revoked++
+						}
+					}
+				}
+			}
+			g.assignment = new_assignment.clone()
+			g.position_at_committed(preserve)!
+			g.needs_rejoin = false
+			g.last_heartbeat = time.now().unix_micro()
+			if revoked > 0 {
+				// cooperative constraint: revoked partitions were assigned
+				// to nobody this generation; rejoin (advertising reduced
+				// ownership) so the next rebalance can place them
+				c.cfg.log(.info,
+					'group ${g.group}: cooperative revoke of ${revoked} partition(s), rejoining')
+				continue
+			}
+			return
+		}
+		g.assignment = new_assignment.clone()
+		g.position_at_committed(map[string]i64{})!
 		g.needs_rejoin = false
 		g.last_heartbeat = time.now().unix_micro()
 		return
@@ -316,9 +360,15 @@ fn (mut g GroupConsumer) lead_assignments(chosen_name string, members []JoinGrou
 			src: m.protocol_metadata
 		}
 		meta.read_from(mut r)!
+		mut owned := map[string][]int{}
+		for op in meta.owned_partitions {
+			owned[op.topic] = op.partitions.clone()
+		}
 		subs << kmsg.MemberSubscription{
-			member_id: m.member_id
-			topics:    meta.topics.clone()
+			member_id:  m.member_id
+			topics:     meta.topics.clone()
+			owned:      owned
+			generation: meta.generation
 		}
 		for t in meta.topics {
 			all_topics[t] = true
@@ -360,7 +410,8 @@ fn (mut g GroupConsumer) lead_assignments(chosen_name string, members []JoinGrou
 
 // position_at_committed builds the inner consumer with cursors at the
 // group's committed offsets, falling back to opts.start where none exist.
-fn (mut g GroupConsumer) position_at_committed() ! {
+// Cursors in preserve win over committed offsets (cooperative retention).
+fn (mut g GroupConsumer) position_at_committed(preserve map[string]i64) ! {
 	mut c := g.client
 	mut req := kmsg.OffsetFetchRequest{
 		group: g.group
@@ -419,6 +470,9 @@ fn (mut g GroupConsumer) position_at_committed() ! {
 			}
 		}
 	}
+	for k, v in preserve {
+		cursors[k] = v
+	}
 	g.inner = &kmsg.Consumer{
 		client:  c
 		cursors: cursors
@@ -452,14 +506,22 @@ pub fn (mut g GroupConsumer) commit() ! {
 	}
 	mut topics := per_topic.keys()
 	topics.sort()
+	// OffsetCommit v10+ addresses topics by uuid (KIP-516): usable once
+	// every topic's id is known, else stay on v9 names
+	mut cap := i16(-1)
 	for t in topics {
-		req.topics << kmsg.OffsetCommitRequestTopic{
+		mut rt := kmsg.OffsetCommitRequestTopic{
 			topic:      t
 			partitions: per_topic[t]
 		}
+		if id := c.topic_id(t) {
+			rt.topic_id = id
+		} else {
+			cap = 9
+		}
+		req.topics << rt
 	}
-	// v10+ addresses topics by uuid; stay on the name-addressed shape
-	body := c.request_broker_capped(g.coordinator, mut req, 9)!
+	body := c.request_broker_capped(g.coordinator, mut req, cap)!
 	mut resp := kmsg.OffsetCommitResponse{
 		version: req.version
 	}

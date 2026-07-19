@@ -35,6 +35,34 @@ pub fn (mut c Client) produce(topic string, mut records []Record) ! {
 	if records.len == 0 {
 		return
 	}
+	// offsets mark completion: reset so retries only cover records whose
+	// partition failed (batches succeed or fail whole-partition)
+	for mut r in records {
+		r.offset = -1
+	}
+	mut attempt := 0
+	for {
+		c.produce_attempt(topic, mut records) or {
+			// retriable partition errors (leadership moving, replicas
+			// catching up) heal with a metadata refresh
+			if attempt < c.cfg.request_retries {
+				if err is kerr.ProduceError {
+					ke := kerr.error_for_code(err.code) or { kerr.unknown_server_error }
+					if ke.retriable {
+						attempt++
+						time.sleep(c.cfg.backoff_for(attempt - 1))
+						c.metadata([topic]) or {}
+						continue
+					}
+				}
+			}
+			return err
+		}
+		return
+	}
+}
+
+fn (mut c Client) produce_attempt(topic string, mut records []Record) ! {
 	// ensure we know the topic's partitions and leaders
 	mut nparts := c.partition_count(topic) or { 0 }
 	if nparts == 0 {
@@ -59,10 +87,17 @@ pub fn (mut c Client) produce(topic string, mut records []Record) ! {
 		}
 	}
 
-	// group record indices per partition, preserving order
+	// group record indices per partition, preserving order; records that
+	// already carry an offset succeeded in a previous attempt
 	mut by_partition := map[int][]int{}
 	for i, r in records {
+		if r.offset >= 0 {
+			continue
+		}
 		by_partition[r.partition] << i
+	}
+	if by_partition.len == 0 {
+		return
 	}
 	// group partitions per leader
 	mut by_leader := map[int][]int{}
@@ -86,6 +121,13 @@ fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, 
 	mut req_topic := kerr.ProduceRequestTopic{
 		topic: topic
 	}
+	// Produce v13+ addresses topics by uuid (KIP-516): usable once
+	// metadata taught us the topic's id, else stay on v12 names
+	mut cap := i16(12)
+	if id := c.topic_id(topic) {
+		req_topic.topic_id = id
+		cap = -1
+	}
 	for partition in partitions {
 		idxs := by_partition[partition]
 		mut batch_records := []kerr.Record{cap: idxs.len}
@@ -102,9 +144,7 @@ fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, 
 	}
 	req.topics = [req_topic]
 
-	// Produce v13+ addresses topics by uuid (KIP-516); stay on v12 (names)
-	// until topic-id resolution is implemented in the consumer phase.
-	body := c.request_broker_capped(leader, mut req, 12)!
+	body := c.request_broker_capped(leader, mut req, cap)!
 	mut resp := kerr.ProduceResponse{
 		version: req.version
 	}
@@ -113,22 +153,32 @@ fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, 
 	}
 	resp.read_from(mut r)!
 
+	// record every successful partition's offsets BEFORE surfacing any
+	// error: an early return would leave accepted records unmarked and a
+	// retry would duplicate them
+	mut first_err := ?kerr.ProduceError(none)
 	for t in resp.topics {
 		for p in t.partitions {
 			idxs := by_partition[p.partition] or { continue }
 			if p.error_code != 0 {
-				e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
-				return kerr.ProduceError{
-					topic:     topic
-					partition: p.partition
-					code:      p.error_code
-					detail:    e.msg()
+				if first_err == none {
+					e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
+					first_err = kerr.ProduceError{
+						topic:     topic
+						partition: p.partition
+						code:      p.error_code
+						detail:    e.msg()
+					}
 				}
+				continue
 			}
 			for j, i in idxs {
 				records[i].offset = p.base_offset + j
 			}
 		}
+	}
+	if e := first_err {
+		return e
 	}
 }
 

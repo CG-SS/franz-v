@@ -142,6 +142,18 @@ fn test_group_two_members_rebalance() {
 	defer {
 		c.close()
 	}
+	// one client per member: members share nothing, matching real
+	// coordinator semantics (serial per-connection processing)
+	mut cm2 := new_client(kfake.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 50 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		cm2.close()
+	}
 
 	mut g1 := c.new_group_consumer('team', ['events'], fast) or {
 		assert false, '${err}'
@@ -155,7 +167,7 @@ fn test_group_two_members_rebalance() {
 
 	// second member joins: coordinator bumps the generation; g1's next
 	// heartbeat sees REBALANCE_IN_PROGRESS and rejoins; leader rebalances
-	mut g2 := c.new_group_consumer('team', ['events'], fast) or {
+	mut g2 := cm2.new_group_consumer('team', ['events'], fast) or {
 		assert false, '${err}'
 		return
 	}
@@ -240,4 +252,248 @@ fn test_group_two_members_rebalance() {
 	}
 	assert reclaimed, 'survivor never reclaimed both partitions'
 	g1.close()
+}
+
+fn test_cooperative_sticky_balancer() {
+	// sole member owns everything, balanced: nothing moves
+	solo := [
+		kfake.MemberSubscription{
+			member_id:  'a'
+			topics:     ['t']
+			owned:      {
+				't': [0, 1, 2, 3]
+			}
+			generation: 1
+		},
+	]
+	counts := {
+		't': 4
+	}
+	r := balance(.cooperative_sticky, solo, counts)
+	assert r['a']['t'] == [0, 1, 2, 3]
+
+	// second member joins: round 1 revokes the excess to nobody
+	two := [
+		kfake.MemberSubscription{
+			member_id:  'a'
+			topics:     ['t']
+			owned:      {
+				't': [0, 1, 2, 3]
+			}
+			generation: 1
+		},
+		kfake.MemberSubscription{
+			member_id: 'b'
+			topics:    ['t']
+		},
+	]
+	r1 := balance(.cooperative_sticky, two, counts)
+	assert r1['a']['t'] == [0, 1] // sticky keep, capped at target
+	assert ('t' in r1['b']) == false // cooperative: not handed over yet
+	// round 2: a rejoins owning only its kept share; freed parts land on b
+	two2 := [
+		kfake.MemberSubscription{
+			member_id:  'a'
+			topics:     ['t']
+			owned:      {
+				't': [0, 1]
+			}
+			generation: 2
+		},
+		kfake.MemberSubscription{
+			member_id:  'b'
+			topics:     ['t']
+			generation: 2
+		},
+	]
+	r2 := balance(.cooperative_sticky, two2, counts)
+	assert r2['a']['t'] == [0, 1]
+	assert r2['b']['t'] == [2, 3]
+
+	// duplicate claim: higher generation wins
+	dup := [
+		kfake.MemberSubscription{
+			member_id:  'stale'
+			topics:     ['t']
+			owned:      {
+				't': [0]
+			}
+			generation: 1
+		},
+		kfake.MemberSubscription{
+			member_id:  'fresh'
+			topics:     ['t']
+			owned:      {
+				't': [0]
+			}
+			generation: 3
+		},
+	]
+	rd := balance(.cooperative_sticky, dup, {
+		't': 1
+	})
+	assert rd['fresh']['t'] == [0]
+	assert ('t' in rd['stale']) == false
+}
+
+struct CoopStatus {
+	who      int
+	assigned []int
+	records  []kfake.Record
+}
+
+fn coop_member_loop(who int, mut g GroupConsumer, mut stop Cancel, status chan CoopStatus) {
+	for !stop.is_done() {
+		records := g.poll() or {
+			time.sleep(30 * time.millisecond)
+			continue
+		}
+		st := kfake.CoopStatus{
+			who:      who
+			assigned: g.assigned()['events'] or { []int{} }
+			records:  records
+		}
+		select {
+			status <- st {}
+			else {}
+		}
+		time.sleep(20 * time.millisecond)
+	}
+	g.close()
+}
+
+fn test_cooperative_group_rebalance_preserves_cursors() {
+	mut cl := kfake.start(1, kfake.ClusterCfg{
+		partitions_per_topic: 4
+	})
+	coop := kfake.GroupOpts{
+		balancers:          [kfake.BalancerKind.cooperative_sticky]
+		heartbeat_interval: 30 * time.millisecond
+	}
+	mut c1 := new_client(kfake.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 50 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c1.close()
+	}
+	mut c2 := new_client(kfake.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 50 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c2.close()
+	}
+
+	mut records := []kfake.Record{}
+	for p in 0 .. 4 {
+		records << kfake.Record{
+			partition: p
+			value:     'old-p${p}'.bytes()
+		}
+	}
+	c1.produce('events', mut records) or {
+		assert false, '${err}'
+		return
+	}
+
+	// solo phase: g1 owns and consumes everything, never committing
+	mut g1 := c1.new_group_consumer('coop', ['events'], coop) or {
+		assert false, '${err}'
+		return
+	}
+	mut first := []kfake.Record{}
+	for _ in 0 .. 40 {
+		first << g1.poll() or {
+			assert false, '${err}'
+			return
+		}
+		if first.len >= 4 {
+			break
+		}
+		time.sleep(20 * time.millisecond)
+	}
+	assert first.len == 4
+	assert g1.assigned()['events'].len == 4
+
+	// concurrent phase: both members polled by their own worker threads
+	mut g2 := c2.new_group_consumer('coop', ['events'], coop) or {
+		assert false, '${err}'
+		return
+	}
+	mut stop := new_cancel()
+	status := chan kfake.CoopStatus{cap: 64}
+	spawn coop_member_loop(1, mut g1, mut stop, status)
+	spawn coop_member_loop(2, mut g2, mut stop, status)
+
+	mut asg := map[int][]int{}
+	mut got := map[int][]kfake.Record{}
+	got[1] = []
+	got[2] = []
+	mut settled := false
+	for _ in 0 .. 600 {
+		st := <-status
+		asg[st.who] = st.assigned.clone()
+		got[st.who] << st.records
+		if asg[1].len == 2 && asg[2].len == 2 {
+			settled = true
+			break
+		}
+	}
+	if !settled {
+		stop.cancel()
+	}
+	assert settled, 'cooperative convergence failed: g1=${asg[1]} g2=${asg[2]}'
+	mut seen := map[int]bool{}
+	for p in asg[1] {
+		seen[p] = true
+	}
+	for p in asg[2] {
+		assert p !in seen
+		seen[p] = true
+	}
+	assert seen.len == 4
+	// sticky proof: g1 retained its lowest owned partitions
+	for p in asg[1] {
+		assert p in [0, 1], 'sticky keep should retain lowest owned, got ${p}'
+	}
+
+	// continuity: new record per partition; without any commits, g1 must
+	// yield only new records (cursors preserved); g2 re-reads its history
+	mut fresh := []kfake.Record{}
+	for p in 0 .. 4 {
+		fresh << kfake.Record{
+			partition: p
+			value:     'new-p${p}'.bytes()
+		}
+	}
+	c1.produce('events', mut fresh) or {
+		stop.cancel()
+		assert false, '${err}'
+		return
+	}
+	mut done := false
+	for _ in 0 .. 600 {
+		st := <-status
+		asg[st.who] = st.assigned.clone()
+		got[st.who] << st.records
+		if got[1].len >= 2 && got[2].len >= 4 {
+			done = true
+			break
+		}
+	}
+	stop.cancel()
+	assert done, 'continuity phase timed out: g1=${got[1].len} g2=${got[2].len}'
+	assert got[1].len == 2, 'g1 expected 2 new records, got ${got[1].len}'
+	for r in got[1] {
+		v := r.value or { []u8{} }
+		assert v.bytestr().starts_with('new-'), 'g1 re-consumed ${v.bytestr()}'
+	}
+	assert got[2].len == 4, 'g2 expected 4 (2 old + 2 new), got ${got[2].len}'
 }

@@ -95,26 +95,62 @@ pub fn (b &Broker) request(req Request) ![]u8 {
 	return error(resp.err_msg)
 }
 
-struct BrokerState {
+// ConnClass separates traffic onto distinct connections per broker.
+// Kafka processes each connection serially, so long-polling requests
+// (fetch max_wait, coordinator-held joins) would otherwise head-of-line
+// block unrelated fast requests like metadata, produce, and heartbeats.
+enum ConnClass {
+	normal
+	fetch
+	coord
+}
+
+fn class_for_key(key i16) ConnClass {
+	return match key {
+		1 { kmsg.ConnClass.fetch }
+		8, 9, 10, 11, 12, 13, 14 { kmsg.ConnClass.coord }
+		else { kmsg.ConnClass.normal }
+	}
+}
+
+// Inflight is one pipelined request awaiting its response, in send order.
+struct Inflight {
+	corr     int
+	flexible bool
+	key      i16
+	resp     chan kmsg.PromisedResp
+}
+
+// ConnState is one pipelined connection: the writer appends to inflight
+// after each successful send; the connection's reader consumes entries in
+// order, reads the matching response, and resolves the promise. Kafka
+// guarantees in-order responses per connection.
+@[heap]
+struct ConnState {
 mut:
-	conn      ?&net.TcpConn
+	conn      &net.TcpConn
+	inflight  chan kmsg.Inflight
+	mu        &sync.Mutex = sync.new_mutex()
+	dead      bool // set by reader on transport/correlation failure
+	closed    bool // set by writer once socket + channel are closed
 	next_corr int
 }
 
 fn (mut b Broker) run() {
-	mut st := kmsg.BrokerState{}
+	mut conns := map[int]&kmsg.ConnState{}
 	defer {
-		b.close_conn(mut st)
+		for _, mut st in conns {
+			b.close_state(mut st)
+		}
 	}
 	for {
 		select {
 			preq := <-b.reqs {
-				resp := b.serve(mut st, preq.req)
-				preq.resp <- resp
+				b.dispatch(preq, mut conns)
 			}
 			_ := <-b.cancel.done {
 				// drain whatever is already queued (non-blocking), then
-				// exit; the deferred close fires the disconnect hooks
+				// exit; the deferred close resolves in-flight promises
 				for {
 					select {
 						preq := <-b.reqs {
@@ -132,83 +168,145 @@ fn (mut b Broker) run() {
 	}
 }
 
-fn (mut b Broker) close_conn(mut st BrokerState) {
-	if mut conn := st.conn {
-		conn.close() or {}
-		for mut h in b.cfg.hooks.on_disconnect {
-			h.on_broker_disconnect(b.meta)
+// dispatch writes one request on its class connection and registers it
+// in-flight; the connection's reader resolves the promise later.
+fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
+	class := class_for_key(preq.req.key())
+	idx := int(class)
+
+	// reap a connection its reader declared dead
+	if idx in conns {
+		mut st0 := conns[idx] or { return }
+		st0.mu.lock()
+		dead := st0.dead
+		st0.mu.unlock()
+		if dead {
+			b.close_state(mut st0)
+			conns.delete(idx)
 		}
 	}
-	st.conn = none
-}
-
-// serve performs one request/response exchange, connecting on demand and
-// tearing the connection down on any transport error.
-fn (mut b Broker) serve(mut st BrokerState, req Request) PromisedResp {
-	mut conn := st.conn or {
-		c := dial_broker(b.meta, mut b.cfg) or {
+	mut st := conns[idx] or {
+		conn := dial_broker(b.meta, mut b.cfg) or {
 			b.cfg.log(.warn, 'dial ${b.meta.addr()} failed: ${err.msg()}')
-			return kmsg.PromisedResp{
+			preq.resp <- kmsg.PromisedResp{
 				err_msg:   err.msg()
 				retriable: true
 			}
+			return
 		}
-		b.cfg.log(.debug, 'connected to ${b.meta.addr()}')
-		st.conn = c
-		c
+		b.cfg.log(.debug, 'connected to ${b.meta.addr()} (${class})')
+		mut nst := &kmsg.ConnState{
+			conn:     conn
+			inflight: chan kmsg.Inflight{cap: b.cfg.max_inflight}
+		}
+		spawn b.reader(mut nst)
+		conns[idx] = nst
+		nst
 	}
 
 	corr := st.next_corr
 	st.next_corr++
-
-	frame := frame_request(req, corr, b.cfg.client_id)
+	frame := frame_request(preq.req, corr, b.cfg.client_id)
 	wstart := time.now()
-	write_all(mut conn, frame) or {
-		b.close_conn(mut st)
+	write_all(mut st.conn, frame) or {
 		for mut h in b.cfg.hooks.on_write {
-			h.on_broker_write(b.meta, req.key(), 0, time.now() - wstart, false)
+			h.on_broker_write(b.meta, preq.req.key(), 0, time.now() - wstart, false)
 		}
-		return kmsg.PromisedResp{
+		b.close_state(mut st)
+		conns.delete(idx)
+		preq.resp <- kmsg.PromisedResp{
 			err_msg:   kmsg.BrokerConnError{
 				host:   b.meta.addr()
 				detail: err.msg()
 			}.msg()
 			retriable: true
 		}
+		return
 	}
 	for mut h in b.cfg.hooks.on_write {
-		h.on_broker_write(b.meta, req.key(), frame.len, time.now() - wstart, true)
+		h.on_broker_write(b.meta, preq.req.key(), frame.len, time.now() - wstart, true)
 	}
+	// registering after the write is safe: the reader takes the entry
+	// first and only then reads the socket
+	st.inflight <- kmsg.Inflight{
+		corr:     corr
+		flexible: response_header_is_flexible(preq.req)
+		key:      preq.req.key()
+		resp:     preq.resp
+	}
+}
 
-	rstart := time.now()
-	payload := read_response_frame(mut conn, b.cfg.max_response_bytes) or {
-		b.close_conn(mut st)
-		for mut h in b.cfg.hooks.on_read {
-			h.on_broker_read(b.meta, req.key(), 0, time.now() - rstart, false)
+// reader resolves in-flight promises for one connection, in order. On any
+// transport or correlation failure it fails the current and all further
+// entries (retriable) and waits for the writer to close the channel.
+fn (mut b Broker) reader(mut st ConnState) {
+	mut failed := false
+	mut fail_msg := ''
+	for {
+		entry := <-st.inflight or { break } // closed by writer: exit
+		if failed {
+			entry.resp <- kmsg.PromisedResp{
+				err_msg:   fail_msg
+				retriable: true
+			}
+			continue
 		}
-		return kmsg.PromisedResp{
-			err_msg:   kmsg.BrokerConnError{
+		rstart := time.now()
+		payload := read_response_frame(mut st.conn, b.cfg.max_response_bytes) or {
+			for mut h in b.cfg.hooks.on_read {
+				h.on_broker_read(b.meta, entry.key, 0, time.now() - rstart, false)
+			}
+			failed = true
+			fail_msg = kmsg.BrokerConnError{
 				host:   b.meta.addr()
 				detail: err.msg()
 			}.msg()
-			retriable: err !is kmsg.ResponseTooLargeError
+			st.mu.lock()
+			st.dead = true
+			st.mu.unlock()
+			entry.resp <- kmsg.PromisedResp{
+				err_msg:   fail_msg
+				retriable: err !is kmsg.ResponseTooLargeError
+			}
+			continue
+		}
+		for mut h in b.cfg.hooks.on_read {
+			h.on_broker_read(b.meta, entry.key, 4 + payload.len, time.now() - rstart, true)
+		}
+		body := strip_response_header(payload, entry.corr, entry.flexible) or {
+			// correlation confusion poisons the connection
+			failed = true
+			fail_msg = err.msg()
+			st.mu.lock()
+			st.dead = true
+			st.mu.unlock()
+			entry.resp <- kmsg.PromisedResp{
+				err_msg:   fail_msg
+				retriable: true
+			}
+			continue
+		}
+		entry.resp <- kmsg.PromisedResp{
+			body: body
 		}
 	}
-	for mut h in b.cfg.hooks.on_read {
-		h.on_broker_read(b.meta, req.key(), 4 + payload.len, time.now() - rstart, true)
-	}
+}
 
-	body := strip_response_header(payload, corr, response_header_is_flexible(req)) or {
-		// correlation/framing confusion poisons the connection; a fresh
-		// connection may recover
-		b.close_conn(mut st)
-		return kmsg.PromisedResp{
-			err_msg:   err.msg()
-			retriable: true
-		}
+// close_state closes a connection's socket and in-flight channel exactly
+// once; the reader then fails whatever remains queued and exits.
+fn (mut b Broker) close_state(mut st ConnState) {
+	st.mu.lock()
+	already := st.closed
+	st.closed = true
+	st.dead = true
+	st.mu.unlock()
+	if already {
+		return
 	}
-	return kmsg.PromisedResp{
-		body: body
+	st.conn.close() or {}
+	st.inflight.close()
+	for mut h in b.cfg.hooks.on_disconnect {
+		h.on_broker_disconnect(b.meta)
 	}
 }
 

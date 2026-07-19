@@ -173,10 +173,19 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 		min_bytes:       c.cfg.fetch_min_bytes
 		max_bytes:       c.cfg.fetch_max_bytes
 		isolation_level: i8(int(c.cfg.isolation_level))
+		session_epoch:   -1 // sessionless (KIP-227)
 	}
+	// Fetch v13+ addresses topics by uuid (KIP-516): usable once every
+	// requested topic's id is known, else stay on v12 names
+	mut cap := i16(-1)
 	for _, target in targets {
 		mut ft := krec.FetchRequestTopic{
 			topic: target.topic
+		}
+		if id := c.topic_id(target.topic) {
+			ft.topic_id = id
+		} else {
+			cap = 12
 		}
 		for p in target.partitions {
 			ft.partitions << krec.FetchRequestTopicPartition{
@@ -190,9 +199,7 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 		req.topics << ft
 	}
 
-	// Fetch v13+ addresses topics by uuid (KIP-516); stay on v12 until
-	// topic-id resolution is implemented.
-	body := c.request_broker_capped(leader, mut req, 12)!
+	body := c.request_broker_capped(leader, mut req, cap)!
 	mut resp := krec.FetchResponse{
 		version: req.version
 	}
@@ -202,10 +209,16 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 	resp.read_from(mut r)!
 
 	for t in resp.topics {
+		// v13+ responses identify topics by uuid only
+		tname := if t.topic != '' {
+			t.topic
+		} else {
+			c.topic_by_id(t.topic_id) or { continue }
+		}
 		for p in t.partitions {
-			key := cursor_key(t.topic, p.partition)
+			key := cursor_key(tname, p.partition)
 			if p.error_code != 0 {
-				co.handle_partition_error(t.topic, p.partition, p.error_code)!
+				co.handle_partition_error(tname, p.partition, p.error_code)!
 				continue
 			}
 			batches := p.record_batches or { []u8{} }
@@ -257,7 +270,7 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 						continue
 					}
 					mut owned := rec
-					owned.topic = t.topic
+					owned.topic = tname
 					owned.partition = p.partition
 					out << owned
 				}

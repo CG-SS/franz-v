@@ -57,14 +57,18 @@ fn create_topic(mut c krec.Client, topic string) {
 // fetch_all fetches records from offset 0 of topic/partition 0 and parses
 // every returned batch.
 fn fetch_all(mut c krec.Client, topic string) []krec.Record {
+	// use uuid addressing (Fetch v13+) when metadata taught us the id
+	tid := c.topic_id(topic) or { [16]u8{} }
 	mut req := krec.FetchRequest{
 		replica_id:      -1
+		session_epoch:   -1
 		max_wait_millis: 500
 		min_bytes:       1
 		max_bytes:       1 << 20
 		topics:          [
 			krec.FetchRequestTopic{
 				topic:      topic
+				topic_id:   tid
 				partitions: [
 					krec.FetchRequestTopicPartition{
 						partition:            0
@@ -77,9 +81,17 @@ fn fetch_all(mut c krec.Client, topic string) []krec.Record {
 			},
 		]
 	}
-	body := c.request(mut req) or {
-		fail('fetch: ${err.msg()}')
-		return []
+	zero := [16]u8{}
+	body := if tid != zero {
+		c.request(mut req) or {
+			fail('fetch: ${err.msg()}')
+			return []
+		}
+	} else {
+		c.request_capped(mut req, 12) or {
+			fail('fetch: ${err.msg()}')
+			return []
+		}
 	}
 	mut resp := krec.FetchResponse{
 		version: req.version
@@ -119,10 +131,6 @@ fn main() {
 	defer {
 		c.close()
 	}
-	// Fetch v13+ addresses topics by uuid; pin to v12 (names) until the
-	// consumer phase implements topic-id resolution.
-	c.cfg.max_versions.set_max_key_version(1, 12)
-
 	meta := c.metadata([]) or {
 		fail('metadata: ${err.msg()}')
 		return

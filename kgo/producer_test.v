@@ -1,6 +1,7 @@
 module kgo
 
 import kfake
+import kmsg
 import krec
 import time
 
@@ -338,4 +339,172 @@ fn test_produce_empty_and_timestamp_defaulting() {
 	}
 	assert records[0].timestamp >= before
 	assert records[0].timestamp <= time.now().unix_milli()
+}
+
+fn test_topic_id_registry_and_lifted_versions() {
+	mut cl := krec.start(1, krec.ClusterCfg{})
+	mut c := new_client(krec.Config{
+		seed_brokers: [cl.seed_addr()]
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c.close()
+	}
+	c.metadata(['ids']) or {
+		assert false, '${err}'
+		return
+	}
+	id := c.topic_id('ids') or {
+		assert false, 'topic id must be learned from metadata'
+		return
+	}
+	assert id != [16]u8{}
+	name := c.topic_by_id(id) or {
+		assert false, 'reverse lookup must work'
+		return
+	}
+	assert name == 'ids'
+	// with ids known, the high uuid-addressed versions negotiate
+	pv := c.negotiated_version(cl.seed_addr(), 0) or { i16(-1) }
+	fv := c.negotiated_version(cl.seed_addr(), 1) or { i16(-1) }
+	assert pv == 13, 'produce negotiated ${pv}'
+	assert fv >= 13, 'fetch negotiated ${fv}'
+}
+
+fn pipeline_worker(mut c Client, n int, results chan int) {
+	mut ok := 0
+	for i in 0 .. n {
+		mut req := krec.MetadataRequest{
+			topics: [
+				krec.MetadataRequestTopic{
+					topic: 'pipe-${i}'
+				},
+			]
+		}
+
+		c.request(mut req) or { continue }
+		ok++
+	}
+	results <- ok
+}
+
+fn test_pipelining_single_connection_per_class() {
+	mut cl := krec.start(1, krec.ClusterCfg{})
+	mut c := new_client(krec.Config{
+		seed_brokers: [cl.seed_addr()]
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c.close()
+	}
+	workers := 8
+	per := 10
+	results := chan int{cap: workers}
+	for _ in 0 .. workers {
+		spawn pipeline_worker(mut c, per, results)
+	}
+	mut total := 0
+	for _ in 0 .. workers {
+		total += <-results
+	}
+	assert total == workers * per
+	// everything (ApiVersions + 80 concurrent metadata) pipelined over
+	// exactly one normal-class connection
+	assert cl.connections(0) == 1, 'expected 1 connection, saw ${cl.connections(0)}'
+}
+
+fn test_fetch_longpoll_does_not_block_other_requests() {
+	mut cl := krec.start(1, krec.ClusterCfg{
+		fetch_delay: 500 * time.millisecond
+	})
+	mut c := new_client(krec.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 800 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c.close()
+	}
+	mut recs := [
+		krec.Record{
+			value: 'x'.bytes()
+		},
+	]
+	c.produce('slow', mut recs) or {
+		assert false, '${err}'
+		return
+	}
+	mut co := c.new_consumer(['slow'], krec.ConsumerOpts{}) or {
+		assert false, '${err}'
+		return
+	}
+
+	// a slow fetch in flight on the fetch connection...
+	fetch_done := chan int{cap: 1}
+	spawn fn (mut co Consumer, out chan int) {
+		recs2 := co.poll() or { []krec.Record{} }
+		out <- recs2.len
+	}(mut co, fetch_done)
+	time.sleep(50 * time.millisecond) // let the fetch depart
+
+	// ...must not delay a metadata request on the normal connection
+	start := time.now()
+	mut req := krec.MetadataRequest{
+		topics: [
+			krec.MetadataRequestTopic{
+				topic: 'slow'
+			},
+		]
+	}
+
+	c.request(mut req) or {
+		assert false, '${err}'
+		return
+	}
+	elapsed := time.now() - start
+	assert elapsed < 300 * time.millisecond, 'metadata blocked ${elapsed} behind the fetch long-poll'
+	fetched := <-fetch_done
+	assert fetched == 1
+}
+
+fn test_inflight_failure_recovery() {
+	// every connection dies after serving 3 requests; pipelined
+	// in-flights fail retriably and the client recovers on fresh
+	// connections
+	mut cl := krec.start(1, krec.ClusterCfg{
+		kill_after_requests: 3
+	})
+	mut c := new_client(krec.Config{
+		seed_brokers:      [cl.seed_addr()]
+		retry_backoff_min: 5 * time.millisecond
+		retry_backoff_max: 10 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c.close()
+	}
+	for i in 0 .. 10 {
+		mut req := krec.MetadataRequest{
+			topics: [
+				krec.MetadataRequestTopic{
+					topic: 'r-${i}'
+				},
+			]
+		}
+
+		body := c.request(mut req) or {
+			assert false, 'request ${i} failed permanently: ${err}'
+			return
+		}
+		assert body.len > 0
+	}
+	assert cl.connections(0) >= 3, 'expected reconnects, saw ${cl.connections(0)}'
 }

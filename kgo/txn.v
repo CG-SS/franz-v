@@ -15,6 +15,7 @@ import time
 
 const ec_producer_fenced = i16(90)
 const ec_invalid_producer_epoch = i16(47)
+const ec_concurrent_transactions = i16(51)
 
 // TxnProducer produces within transactions. Obtain one from
 // Client.new_txn_producer.
@@ -94,23 +95,38 @@ fn (mut t TxnProducer) init_producer_id() ! {
 		transactional_id:           t.transactional_id
 		transaction_timeout_millis: 60000
 	}
-	body := c.request_broker(t.coordinator, mut req)!
-	mut resp := krec.InitProducerIDResponse{
-		version: req.version
+	// the coordinator loads its state lazily after (re)start; retry
+	for _ in 0 .. 120 {
+		body := c.request_broker(t.coordinator, mut req)!
+		mut resp := krec.InitProducerIDResponse{
+			version: req.version
+		}
+		mut r := krec.Reader{
+			src: body
+		}
+		resp.read_from(mut r)!
+		match resp.error_code {
+			0 {
+				t.producer_id = resp.producer_id
+				t.producer_epoch = resp.producer_epoch
+				t.seqs = map[string]int{}
+				c.cfg.log(.info,
+					'txn ${t.transactional_id}: producer id ${t.producer_id} epoch ${t.producer_epoch}')
+				return
+			}
+			ec_coordinator_load, ec_coordinator_not_available {
+				time.sleep(250 * time.millisecond)
+			}
+			ec_not_coordinator {
+				t.find_txn_coordinator()!
+			}
+			else {
+				e := krec.error_for_code(resp.error_code) or { krec.unknown_server_error }
+				return error('init producer id: ${e.msg()}')
+			}
+		}
 	}
-	mut r := krec.Reader{
-		src: body
-	}
-	resp.read_from(mut r)!
-	if resp.error_code != 0 {
-		e := krec.error_for_code(resp.error_code) or { krec.unknown_server_error }
-		return error('init producer id: ${e.msg()}')
-	}
-	t.producer_id = resp.producer_id
-	t.producer_epoch = resp.producer_epoch
-	t.seqs = map[string]int{}
-	c.cfg.log(.info,
-		'txn ${t.transactional_id}: producer id ${t.producer_id} epoch ${t.producer_epoch}')
+	return error('init producer id: coordinator still loading after retries')
 }
 
 // producer returns the coordinator-assigned producer id and epoch.
@@ -151,24 +167,41 @@ fn (mut t TxnProducer) add_partitions(topic string, partitions []int) ! {
 			},
 		]
 	}
-	// v4+ batches transactions per request; stay on the classic shape
-	body := c.request_broker_capped(t.coordinator, mut req, 3)!
-	mut resp := krec.AddPartitionsToTxnResponse{
-		version: req.version
-	}
-	mut r := krec.Reader{
-		src: body
-	}
-	resp.read_from(mut r)!
-	for rt in resp.topics {
-		for p in rt.partitions {
-			if p.error_code != 0 {
-				e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
-				return error('add partitions to txn ${rt.topic}[${p.partition}]: ${e.msg()}')
-			}
-			t.added['${rt.topic}/${p.partition}'] = true
+	// v4+ batches transactions per request; stay on the classic shape.
+	// CONCURRENT_TRANSACTIONS is returned while the previous EndTxn's
+	// markers are still being written; retry like other clients do.
+	for _ in 0 .. 100 {
+		body := c.request_broker_capped(t.coordinator, mut req, 3)!
+		mut resp := krec.AddPartitionsToTxnResponse{
+			version: req.version
 		}
+		mut r := krec.Reader{
+			src: body
+		}
+		resp.read_from(mut r)!
+		mut retry := false
+		for rt in resp.topics {
+			for p in rt.partitions {
+				match p.error_code {
+					0 {
+						t.added['${rt.topic}/${p.partition}'] = true
+					}
+					ec_concurrent_transactions, ec_coordinator_load, ec_coordinator_not_available {
+						retry = true
+					}
+					else {
+						e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
+						return error('add partitions to txn ${rt.topic}[${p.partition}]: ${e.msg()}')
+					}
+				}
+			}
+		}
+		if !retry {
+			return
+		}
+		time.sleep(100 * time.millisecond)
 	}
+	return error('add partitions to txn: coordinator busy after retries')
 }
 
 // produce produces records inside the open transaction, with idempotent
@@ -224,6 +257,11 @@ pub fn (mut t TxnProducer) produce(topic string, mut records []Record) ! {
 		mut req_topic := krec.ProduceRequestTopic{
 			topic: topic
 		}
+		mut cap := i16(12)
+		if id := c.topic_id(topic) {
+			req_topic.topic_id = id
+			cap = -1
+		}
 		for partition in parts {
 			idxs := by_partition[partition]
 			mut batch_records := []krec.Record{cap: idxs.len}
@@ -244,7 +282,7 @@ pub fn (mut t TxnProducer) produce(topic string, mut records []Record) ! {
 			}
 		}
 		req.topics = [req_topic]
-		body := c.request_broker_capped(leader, mut req, 12)!
+		body := c.request_broker_capped(leader, mut req, cap)!
 		mut resp := krec.ProduceResponse{
 			version: req.version
 		}
@@ -252,23 +290,30 @@ pub fn (mut t TxnProducer) produce(topic string, mut records []Record) ! {
 			src: body
 		}
 		resp.read_from(mut r)!
+		mut first_err := ?krec.ProduceError(none)
 		for rt in resp.topics {
 			for p in rt.partitions {
 				idxs := by_partition[p.partition] or { continue }
 				if p.error_code != 0 {
-					e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
-					return krec.ProduceError{
-						topic:     topic
-						partition: p.partition
-						code:      p.error_code
-						detail:    e.msg()
+					if first_err == none {
+						e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
+						first_err = krec.ProduceError{
+							topic:     topic
+							partition: p.partition
+							code:      p.error_code
+							detail:    e.msg()
+						}
 					}
+					continue
 				}
 				for j, i in idxs {
 					records[i].offset = p.base_offset + j
 				}
 				t.seqs['${topic}/${p.partition}'] += idxs.len
 			}
+		}
+		if e := first_err {
+			return e
 		}
 	}
 }
@@ -291,15 +336,23 @@ pub fn (mut t TxnProducer) send_offsets(group string, offsets map[string]i64) ! 
 		producer_epoch:   t.producer_epoch
 		group:            group
 	}
-	abody := c.request_broker(t.coordinator, mut areq)!
-	mut aresp := krec.AddOffsetsToTxnResponse{
-		version: areq.version
-	}
-	mut ar := krec.Reader{
-		src: abody
-	}
-	aresp.read_from(mut ar)!
-	if aresp.error_code != 0 {
+	for _ in 0 .. 100 {
+		abody := c.request_broker(t.coordinator, mut areq)!
+		mut aresp := krec.AddOffsetsToTxnResponse{
+			version: areq.version
+		}
+		mut ar := krec.Reader{
+			src: abody
+		}
+		aresp.read_from(mut ar)!
+		if aresp.error_code == 0 {
+			break
+		}
+		if aresp.error_code in [ec_concurrent_transactions, ec_coordinator_load,
+			ec_coordinator_not_available] {
+			time.sleep(100 * time.millisecond)
+			continue
+		}
 		e := krec.error_for_code(aresp.error_code) or { krec.unknown_server_error }
 		return error('add offsets to txn: ${e.msg()}')
 	}
@@ -374,20 +427,31 @@ fn (mut t TxnProducer) end(commit bool) ! {
 		commit:           commit
 	}
 	// v5+ (KIP-890) changes epoch semantics; stay on the classic shape
-	body := c.request_broker_capped(t.coordinator, mut req, 4)!
-	mut resp := krec.EndTxnResponse{
-		version: req.version
+	for _ in 0 .. 100 {
+		body := c.request_broker_capped(t.coordinator, mut req, 4)!
+		mut resp := krec.EndTxnResponse{
+			version: req.version
+		}
+		mut r := krec.Reader{
+			src: body
+		}
+		resp.read_from(mut r)!
+		match resp.error_code {
+			0 {
+				t.in_txn = false
+				t.added = map[string]bool{}
+				return
+			}
+			ec_concurrent_transactions, ec_coordinator_load, ec_coordinator_not_available {
+				time.sleep(100 * time.millisecond)
+			}
+			else {
+				e := krec.error_for_code(resp.error_code) or { krec.unknown_server_error }
+				return error('end txn: ${e.msg()}')
+			}
+		}
 	}
-	mut r := krec.Reader{
-		src: body
-	}
-	resp.read_from(mut r)!
-	if resp.error_code != 0 {
-		e := krec.error_for_code(resp.error_code) or { krec.unknown_server_error }
-		return error('end txn: ${e.msg()}')
-	}
-	t.in_txn = false
-	t.added = map[string]bool{}
+	return error('end txn: coordinator busy after retries')
 }
 
 // commit commits the open transaction: its records become visible to

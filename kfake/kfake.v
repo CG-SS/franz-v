@@ -17,11 +17,11 @@ pub struct ClusterCfg {
 pub mut:
 	// advertised maps API key -> max version advertised via ApiVersions.
 	advertised map[i16]i16 = {
-		i16(0):  i16(9)
-		i16(1):  i16(12)
+		i16(0):  i16(13)
+		i16(1):  i16(16)
 		i16(2):  i16(7)
-		i16(3):  i16(12)
-		i16(8):  i16(6)
+		i16(3):  i16(13)
+		i16(8):  i16(10)
 		i16(9):  i16(5)
 		i16(10): i16(2)
 		i16(11): i16(5)
@@ -43,6 +43,12 @@ pub mut:
 	// produce_error_code, when non-zero, fails every produced partition
 	// with this Kafka error code.
 	produce_error_code i16
+	// fetch_delay is served before answering any fetch, to simulate
+	// long-polling.
+	fetch_delay time.Duration
+	// kill_after_requests, when > 0, closes each connection after
+	// serving this many requests on it (mid-stream failure injection).
+	kill_after_requests int
 }
 
 // Cluster is a running fake cluster.
@@ -56,9 +62,12 @@ pub mut:
 mut:
 	mu          &sync.Mutex = sync.new_mutex()
 	fails       int
+	conns       map[int]int              // node -> connections accepted
 	stored      map[string][]kmsg.Record // 'topic/partition' -> records
 	groups      map[string]&kmsg.FakeGroup
 	next_member int
+	topic_uuids map[string][16]u8
+	uuid_names  map[string]string
 }
 
 // start launches a fake cluster with the given node count.
@@ -126,6 +135,7 @@ fn (mut cl Cluster) serve_node(node_id int, mut l net.TcpListener) {
 	for {
 		mut conn := l.accept() or { return }
 		cl.mu.lock()
+		cl.conns[node_id]++
 		fail := cl.fails > 0
 		if fail {
 			cl.fails--
@@ -139,7 +149,17 @@ fn (mut cl Cluster) serve_node(node_id int, mut l net.TcpListener) {
 	}
 }
 
+// connections reports how many connections a node has accepted.
+pub fn (mut cl Cluster) connections(node_id int) int {
+	cl.mu.lock()
+	defer {
+		cl.mu.unlock()
+	}
+	return cl.conns[node_id]
+}
+
 fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
+	mut served := 0
 	for {
 		mut size_buf := []u8{len: 4}
 		read_full(mut conn, mut size_buf) or {
@@ -165,7 +185,7 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 		r.read_nullable_string() or { '' }
 		flexible := (key == 18 && version >= 3) || (key == 3 && version >= 9)
 			|| (key == 0 && version >= 9) || (key == 1 && version >= 12)
-			|| (key == 2 && version >= 6)
+			|| (key == 2 && version >= 6) || (key == 8 && version >= 8)
 		if flexible {
 			num_tags := r.read_uvarint()
 			for _ in 0 .. num_tags {
@@ -176,6 +196,9 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 		}
 		body := payload[r.off..].clone()
 
+		if key == 1 && i64(cl.cfg.fetch_delay) > 0 {
+			time.sleep(cl.cfg.fetch_delay)
+		}
 		resp_body := match key {
 			18 { cl.answer_api_versions(body, version) }
 			3 { cl.answer_metadata(node_id, body, version) }
@@ -202,6 +225,11 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 		framed.buf << hdr.buf
 		framed.buf << resp_body
 		write_all(mut conn, framed.buf) or {
+			conn.close() or {}
+			return
+		}
+		served++
+		if cl.cfg.kill_after_requests > 0 && served >= cl.cfg.kill_after_requests {
 			conn.close() or {}
 			return
 		}
@@ -257,6 +285,10 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 		controller_id: node_id
 	}
 	for t in req_topics {
+		tname0 := t.topic or { '' }
+		cl.mu.lock()
+		tid := cl.uuid_for(tname0)
+		cl.mu.unlock()
 		mut partitions := []kmsg.MetadataResponseTopicPartition{}
 		for p in 0 .. cl.cfg.partitions_per_topic {
 			partitions << kmsg.MetadataResponseTopicPartition{
@@ -268,6 +300,7 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 		}
 		resp.topics << kmsg.MetadataResponseTopic{
 			topic:      t.topic
+			topic_id:   tid
 			partitions: partitions
 		}
 	}
@@ -299,9 +332,16 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 		version: version
 	}
 	for t in req.topics {
-		topic := t.topic
+		cl.mu.lock()
+		topic := cl.resolve_topic(t.topic, t.topic_id) or {
+			cl.mu.unlock()
+			continue
+		}
+		tid := cl.uuid_for(topic)
+		cl.mu.unlock()
 		mut resp_topic := kmsg.ProduceResponseTopic{
-			topic: topic
+			topic:    topic
+			topic_id: tid
 		}
 		for p in t.partitions {
 			mut code := cl.cfg.produce_error_code
@@ -354,11 +394,19 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 		version: version
 	}
 	for t in req.topics {
+		cl.mu.lock()
+		tname := cl.resolve_topic(t.topic, t.topic_id) or {
+			cl.mu.unlock()
+			continue
+		}
+		tid := cl.uuid_for(tname)
+		cl.mu.unlock()
 		mut resp_topic := kmsg.FetchResponseTopic{
-			topic: t.topic
+			topic:    tname
+			topic_id: tid
 		}
 		for p in t.partitions {
-			skey := '${t.topic}/${p.partition}'
+			skey := '${tname}/${p.partition}'
 			cl.mu.lock()
 			all := cl.stored[skey].clone()
 			cl.mu.unlock()
@@ -456,6 +504,34 @@ mut:
 	offsets         map[string]i64 // 'topic/partition' -> committed
 }
 
+// uuid_for assigns a deterministic non-zero uuid per topic name.
+fn (mut cl Cluster) uuid_for(topic string) [16]u8 {
+	if topic in cl.topic_uuids {
+		return cl.topic_uuids[topic]
+	}
+	mut id := [16]u8{}
+	id[0] = u8(topic.len + 1)
+	for i, ch in topic.bytes() {
+		id[1 + (i % 15)] ^= ch + u8(i)
+	}
+	cl.topic_uuids[topic] = id
+	cl.uuid_names[id[..].hex()] = topic
+	return id
+}
+
+fn (mut cl Cluster) topic_from(id [16]u8) ?string {
+	return cl.uuid_names[id[..].hex()] or { return none }
+}
+
+// resolve_topic returns the name for a request topic addressed by name or
+// by uuid.
+fn (mut cl Cluster) resolve_topic(name string, id [16]u8) ?string {
+	if name != '' {
+		return name
+	}
+	return cl.topic_from(id)
+}
+
 fn (mut cl Cluster) group(name string) &FakeGroup {
 	if name !in cl.groups {
 		cl.groups[name] = &kmsg.FakeGroup{}
@@ -523,6 +599,10 @@ fn (mut cl Cluster) answer_join_group(body []u8, version i16) []u8 {
 	meta := if req.protocols.len > 0 { req.protocols[0].metadata.clone() } else { []u8{} }
 	if req.member_id !in g.members {
 		g.generation++ // membership change: everyone else must rejoin
+	} else if g.assignments_gen == g.generation {
+		// a member rejoining a stable group (e.g. cooperative second
+		// round) starts a fresh rebalance
+		g.generation++
 	}
 	g.members[req.member_id] = kmsg.FakeMember{
 		metadata:  meta
@@ -680,15 +760,19 @@ fn (mut cl Cluster) answer_offset_commit(body []u8, version i16) []u8 {
 	mut g := cl.group(req.group)
 	stale := req.generation != g.generation
 	for t in req.topics {
+		// already under cl.mu here (locked before the topic loop)
+		ctname := cl.resolve_topic(t.topic, t.topic_id) or { continue }
+		ctid := cl.uuid_for(ctname)
 		mut rt := kmsg.OffsetCommitResponseTopic{
-			topic: t.topic
+			topic:    ctname
+			topic_id: ctid
 		}
 		for p in t.partitions {
 			mut code := i16(0)
 			if stale {
 				code = 22 // ILLEGAL_GENERATION
 			} else {
-				g.offsets['${t.topic}/${p.partition}'] = p.offset
+				g.offsets['${ctname}/${p.partition}'] = p.offset
 			}
 			rt.partitions << kmsg.OffsetCommitResponseTopicPartition{
 				partition:  p.partition
