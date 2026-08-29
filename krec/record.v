@@ -19,7 +19,7 @@ pub struct Record {
 pub mut:
 	key       ?[]u8
 	value     ?[]u8
-	headers   []kbin.RecordHeader
+	headers   []RecordHeader
 	timestamp i64 // unix milliseconds; 0 means "now" at produce time
 	topic     string
 	partition int = -1
@@ -28,7 +28,7 @@ pub mut:
 
 // encode_record appends the magic-2 wire form of r to w, expressed as
 // deltas against the batch's base offset/timestamp.
-fn encode_record(mut w Writer, r &Record, offset_delta int, timestamp_delta i64) {
+fn encode_record(mut w kbin.Writer, r &Record, offset_delta int, timestamp_delta i64) {
 	mut body := kbin.Writer{}
 	body.write_int8(0) // attributes: unused
 	body.write_varlong(timestamp_delta)
@@ -46,7 +46,7 @@ fn encode_record(mut w Writer, r &Record, offset_delta int, timestamp_delta i64)
 
 // decode_record reads one record from r, resolving deltas against the
 // batch base offset/timestamp.
-fn decode_record(mut r Reader, base_offset i64, base_timestamp i64) !Record {
+fn decode_record(mut r kbin.Reader, base_offset i64, base_timestamp i64) !Record {
 	length := r.read_varint()
 	if length < 0 || r.remaining() < length {
 		return error('record length ${length} exceeds remaining ${r.remaining()}')
@@ -58,11 +58,11 @@ fn decode_record(mut r Reader, base_offset i64, base_timestamp i64) !Record {
 	key := r.read_varint_bytes()
 	value := r.read_varint_bytes()
 	num_headers := r.read_varint()
-	mut headers := []kbin.RecordHeader{cap: if num_headers > 0 { num_headers } else { 0 }}
+	mut headers := []RecordHeader{cap: if num_headers > 0 { num_headers } else { 0 }}
 	for _ in 0 .. num_headers {
 		hkey := r.read_varint_string()
 		hval := r.read_varint_bytes()
-		headers << kbin.RecordHeader{
+		headers << RecordHeader{
 			key:   hkey
 			value: hval
 		}
@@ -73,7 +73,7 @@ fn decode_record(mut r Reader, base_offset i64, base_timestamp i64) !Record {
 	}
 	key_c := if k := key { ?[]u8(k.clone()) } else { ?[]u8(none) }
 	val_c := if v := value { ?[]u8(v.clone()) } else { ?[]u8(none) }
-	return kbin.Record{
+	return Record{
 		key:       key_c
 		value:     val_c
 		headers:   headers

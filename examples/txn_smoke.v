@@ -17,8 +17,8 @@ fn fail(msg string) {
 	exit(1)
 }
 
-fn new_client(addr string, iso kmsg.IsolationLevel) &kmsg.Client {
-	return kmsg.new_client(kmsg.Config{
+fn new_client(addr string, iso kgo.IsolationLevel) &kgo.Client {
+	return kgo.new_client(kgo.Config{
 		seed_brokers:    [addr]
 		fetch_max_wait:  300 * time.millisecond
 		isolation_level: iso
@@ -28,7 +28,7 @@ fn new_client(addr string, iso kmsg.IsolationLevel) &kmsg.Client {
 	}
 }
 
-fn create_topic(mut c kmsg.Client, topic string, partitions int) {
+fn create_topic(mut c kgo.Client, topic string, partitions int) {
 	mut req := kmsg.CreateTopicsRequest{
 		timeout_millis: 10000
 		topics:         [
@@ -43,8 +43,8 @@ fn create_topic(mut c kmsg.Client, topic string, partitions int) {
 	c.metadata([topic]) or { fail('metadata ${topic}: ${err.msg()}') }
 }
 
-fn poll_n(mut co kmsg.Consumer, want int, deadline_ms i64) []kmsg.Record {
-	mut out := []kmsg.Record{}
+fn poll_n(mut co kgo.Consumer, want int, deadline_ms i64) []kgo.Record {
+	mut out := []kgo.Record{}
 	end := time.now().unix_milli() + deadline_ms
 	for time.now().unix_milli() < end {
 		out << co.poll() or {
@@ -93,11 +93,11 @@ fn main() {
 		return
 	}
 	mut committed := [
-		kmsg.Record{
+		kgo.Record{
 			key:   'c1'.bytes()
 			value: 'committed one'.bytes()
 		},
-		kmsg.Record{
+		kgo.Record{
 			key:   'c2'.bytes()
 			value: 'committed two'.bytes()
 		},
@@ -111,7 +111,7 @@ fn main() {
 		return
 	}
 
-	mut co_c := cc.new_consumer([topic], kmsg.ConsumerOpts{}) or {
+	mut co_c := cc.new_consumer([topic], kgo.ConsumerOpts{}) or {
 		fail('consumer: ${err.msg()}')
 		return
 	}
@@ -131,11 +131,11 @@ fn main() {
 		return
 	}
 	mut doomed := [
-		kmsg.Record{
+		kgo.Record{
 			key:   'a1'.bytes()
 			value: 'aborted one'.bytes()
 		},
-		kmsg.Record{
+		kgo.Record{
 			key:   'a2'.bytes()
 			value: 'aborted two'.bytes()
 		},
@@ -156,7 +156,7 @@ fn main() {
 		fail('read_committed leaked aborted record: ${v.bytestr()}')
 	}
 	// read_uncommitted from earliest: sees committed 2 + aborted 2
-	mut co_u := cu.new_consumer([topic], kmsg.ConsumerOpts{}) or {
+	mut co_u := cu.new_consumer([topic], kgo.ConsumerOpts{}) or {
 		fail('consumer u: ${err.msg()}')
 		return
 	}
@@ -172,7 +172,7 @@ fn main() {
 		return
 	}
 	mut third := [
-		kmsg.Record{
+		kgo.Record{
 			value: 'committed three'.bytes()
 		},
 	]
@@ -214,7 +214,7 @@ fn main() {
 	}
 	if !fenced {
 		mut zombie := [
-			kmsg.Record{
+			kgo.Record{
 				value: 'from the zombie'.bytes()
 			},
 		]
@@ -240,9 +240,9 @@ fn main() {
 	create_topic(mut c, in_topic, 1)
 	create_topic(mut c, out_topic, 1)
 
-	mut input := []kmsg.Record{}
+	mut input := []kgo.Record{}
 	for i in 0 .. 4 {
-		input << kmsg.Record{
+		input << kgo.Record{
 			value: 'in-${i}'.bytes()
 		}
 	}
@@ -255,14 +255,14 @@ fn main() {
 	defer {
 		gc.close()
 	}
-	gopts := kmsg.GroupOpts{
+	gopts := kgo.GroupOpts{
 		heartbeat_interval: 300 * time.millisecond
 	}
 	mut g := gc.new_group_consumer(group, [in_topic], gopts) or {
 		fail('eos group: ${err.msg()}')
 		return
 	}
-	mut consumed := []kmsg.Record{}
+	mut consumed := []kgo.Record{}
 	for _ in 0 .. 40 {
 		consumed << g.poll() or {
 			fail('eos poll: ${err.msg()}')
@@ -281,10 +281,10 @@ fn main() {
 		fail('eos begin: ${err.msg()}')
 		return
 	}
-	mut transformed := []kmsg.Record{}
+	mut transformed := []kgo.Record{}
 	for r in consumed {
 		v := r.value or { []u8{} }
-		transformed << kmsg.Record{
+		transformed << kgo.Record{
 			value: 'OUT(${v.bytestr()})'.bytes()
 		}
 	}
@@ -302,7 +302,7 @@ fn main() {
 	}
 
 	// output visible to read_committed
-	mut co_out := cc.new_consumer([out_topic], kmsg.ConsumerOpts{}) or {
+	mut co_out := cc.new_consumer([out_topic], kgo.ConsumerOpts{}) or {
 		fail('out consumer: ${err.msg()}')
 		return
 	}
@@ -336,7 +336,7 @@ fn main() {
 
 	// ---- 5. EOS abort: neither output nor offsets take effect ----
 	mut input2 := [
-		kmsg.Record{
+		kgo.Record{
 			value: 'in-late'.bytes()
 		},
 	]
@@ -344,7 +344,7 @@ fn main() {
 		fail('produce late input: ${err.msg()}')
 		return
 	}
-	mut late := []kmsg.Record{}
+	mut late := []kgo.Record{}
 	for _ in 0 .. 40 {
 		late << g2.poll() or {
 			fail('late poll: ${err.msg()}')
@@ -363,7 +363,7 @@ fn main() {
 		return
 	}
 	mut doomed_out := [
-		kmsg.Record{
+		kgo.Record{
 			value: 'OUT(in-late)'.bytes()
 		},
 	]
@@ -392,7 +392,7 @@ fn main() {
 		fail('eos group 3: ${err.msg()}')
 		return
 	}
-	mut replayed := []kmsg.Record{}
+	mut replayed := []kgo.Record{}
 	for _ in 0 .. 40 {
 		replayed << g3.poll() or {
 			fail('replay poll: ${err.msg()}')

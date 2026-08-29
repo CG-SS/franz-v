@@ -40,10 +40,10 @@ pub interface Request {
 	key() i16
 	max_version() i16
 	is_flexible() bool
-	write_to(mut w Writer)
+	write_to(mut w kbin.Writer)
 mut:
 	version i16
-	read_from(mut r Reader) !
+	read_from(mut r kbin.Reader) !
 }
 
 // Response is implemented by all generated *Response types. A response's
@@ -53,15 +53,15 @@ pub interface Response {
 	key() i16
 	max_version() i16
 	is_flexible() bool
-	write_to(mut w Writer)
+	write_to(mut w kbin.Writer)
 mut:
 	version i16
-	read_from(mut r Reader) !
+	read_from(mut r kbin.Reader) !
 }
 
 // write_unknown_tags appends preserved unknown tags to w. Generated code
 // calls this at the end of each flexible tag section.
-pub fn write_unknown_tags(mut w Writer, tags []UnknownTag) {
+pub fn write_unknown_tags(mut w kbin.Writer, tags []UnknownTag) {
 	for t in tags {
 		w.write_uvarint(t.tag)
 		w.write_uvarint(u32(t.data.len))

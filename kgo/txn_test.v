@@ -3,8 +3,8 @@ module kgo
 import kfake
 import time
 
-fn txn_client(cl &Cluster, iso IsolationLevel) &Client {
-	return new_client(kfake.Config{
+fn txn_client(cl &kfake.Cluster, iso IsolationLevel) &Client {
+	return new_client(Config{
 		seed_brokers:    [cl.seed_addr()]
 		fetch_max_wait:  100 * time.millisecond
 		isolation_level: iso
@@ -36,11 +36,11 @@ fn test_txn_commit_and_abort_isolation() {
 		return
 	}
 	mut committed := [
-		kfake.Record{
+		Record{
 			key:   'c1'.bytes()
 			value: 'committed one'.bytes()
 		},
-		kfake.Record{
+		Record{
 			value: 'committed two'.bytes()
 		},
 	]
@@ -54,7 +54,7 @@ fn test_txn_commit_and_abort_isolation() {
 		return
 	}
 
-	mut co_c := cc.new_consumer(['events'], kfake.ConsumerOpts{}) or {
+	mut co_c := cc.new_consumer(['events'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -72,10 +72,10 @@ fn test_txn_commit_and_abort_isolation() {
 		return
 	}
 	mut doomed := [
-		kfake.Record{
+		Record{
 			value: 'aborted one'.bytes()
 		},
-		kfake.Record{
+		Record{
 			value: 'aborted two'.bytes()
 		},
 	]
@@ -99,7 +99,7 @@ fn test_txn_commit_and_abort_isolation() {
 	defer {
 		cu.close()
 	}
-	mut co_u := cu.new_consumer(['events'], kfake.ConsumerOpts{}) or {
+	mut co_u := cu.new_consumer(['events'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -115,7 +115,7 @@ fn test_txn_commit_and_abort_isolation() {
 		return
 	}
 	mut third := [
-		kfake.Record{
+		Record{
 			value: 'committed three'.bytes()
 		},
 	]
@@ -168,7 +168,7 @@ fn test_txn_zombie_fencing() {
 		return
 	}
 	mut zombie := [
-		kfake.Record{
+		Record{
 			value: 'from the zombie'.bytes()
 		},
 	]
@@ -185,7 +185,7 @@ fn test_txn_zombie_fencing() {
 		return
 	}
 	mut ok := [
-		kfake.Record{
+		Record{
 			value: 'from the fresh'.bytes()
 		},
 	]
@@ -205,14 +205,14 @@ fn test_txn_eos_commit_and_abort() {
 	defer {
 		c.close()
 	}
-	gopts := kfake.GroupOpts{
+	gopts := GroupOpts{
 		heartbeat_interval: 30 * time.millisecond
 	}
 
 	// input records
-	mut input := []kfake.Record{}
+	mut input := []Record{}
 	for i in 0 .. 4 {
-		input << kfake.Record{
+		input << Record{
 			value: 'in-${i}'.bytes()
 		}
 	}
@@ -230,7 +230,7 @@ fn test_txn_eos_commit_and_abort() {
 		assert false, '${err}'
 		return
 	}
-	mut consumed := []kfake.Record{}
+	mut consumed := []Record{}
 	for _ in 0 .. 40 {
 		consumed << g.poll() or {
 			assert false, '${err}'
@@ -255,10 +255,10 @@ fn test_txn_eos_commit_and_abort() {
 		assert false, '${err}'
 		return
 	}
-	mut out := []kfake.Record{}
+	mut out := []Record{}
 	for r in consumed {
 		v := r.value or { []u8{} }
-		out << kfake.Record{
+		out << Record{
 			value: 'OUT(${v.bytestr()})'.bytes()
 		}
 	}
@@ -280,7 +280,7 @@ fn test_txn_eos_commit_and_abort() {
 	defer {
 		cc.close()
 	}
-	mut co := cc.new_consumer(['eos-out'], kfake.ConsumerOpts{}) or {
+	mut co := cc.new_consumer(['eos-out'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -310,7 +310,7 @@ fn test_txn_eos_commit_and_abort() {
 
 	// ---- abort path: output hidden AND offsets rolled back ----
 	mut late := [
-		kfake.Record{
+		Record{
 			value: 'in-late'.bytes()
 		},
 	]
@@ -318,7 +318,7 @@ fn test_txn_eos_commit_and_abort() {
 		assert false, '${err}'
 		return
 	}
-	mut late_got := []kfake.Record{}
+	mut late_got := []Record{}
 	for _ in 0 .. 40 {
 		late_got << g2.poll() or {
 			assert false, '${err}'
@@ -336,7 +336,7 @@ fn test_txn_eos_commit_and_abort() {
 		return
 	}
 	mut doomed_out := [
-		kfake.Record{
+		Record{
 			value: 'OUT(in-late)'.bytes()
 		},
 	]
@@ -367,7 +367,7 @@ fn test_txn_eos_commit_and_abort() {
 		assert false, '${err}'
 		return
 	}
-	mut replayed := []kfake.Record{}
+	mut replayed := []Record{}
 	for _ in 0 .. 40 {
 		replayed << g3.poll() or {
 			assert false, '${err}'

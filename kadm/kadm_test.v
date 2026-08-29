@@ -5,7 +5,7 @@ import kgo
 import time
 
 fn test_topic_lifecycle_and_configs() {
-	mut cl := kgo.start(1, kgo.ClusterCfg{})
+	mut cl := kfake.start(1, kfake.ClusterCfg{})
 	mut c := kgo.new_client(kgo.Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
@@ -19,11 +19,11 @@ fn test_topic_lifecycle_and_configs() {
 
 	// create two topics, one with a config
 	results := a.create_topics([
-		kgo.TopicSpec{
+		TopicSpec{
 			topic:      'orders'
 			partitions: 3
 		},
-		kgo.TopicSpec{
+		TopicSpec{
 			topic:   'audit'
 			configs: {
 				'retention.ms': '86400000'
@@ -42,7 +42,7 @@ fn test_topic_lifecycle_and_configs() {
 	}
 	// duplicate create reports TOPIC_ALREADY_EXISTS
 	dup := a.create_topics([
-		kgo.TopicSpec{
+		TopicSpec{
 			topic: 'orders'
 		},
 	]) or {
@@ -140,7 +140,7 @@ fn test_topic_lifecycle_and_configs() {
 }
 
 fn test_groups_offsets_and_lag() {
-	mut cl := kgo.start(1, kgo.ClusterCfg{
+	mut cl := kfake.start(1, kfake.ClusterCfg{
 		partitions_per_topic: 2
 	})
 	mut c := kgo.new_client(kgo.Config{
@@ -274,7 +274,7 @@ fn test_groups_offsets_and_lag() {
 }
 
 fn test_delete_records_truncation() {
-	mut cl := kgo.start(1, kgo.ClusterCfg{})
+	mut cl := kfake.start(1, kfake.ClusterCfg{})
 	mut c := kgo.new_client(kgo.Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond

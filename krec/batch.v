@@ -19,7 +19,7 @@ const batch_len_after_length_field = 49
 // non-idempotent, non-transactional batch.
 pub struct BatchOpts {
 pub mut:
-	codec          kmsg.Codec
+	codec          Codec
 	base_offset    i64 // the batch's first offset (brokers rewrite on produce)
 	producer_id    i64 = -1
 	producer_epoch i16 = -1
@@ -41,7 +41,7 @@ pub fn build_record_batch(records []Record, opts BatchOpts) ![]u8 {
 	}
 	base_ts := records[0].timestamp
 	mut max_ts := base_ts
-	mut payload := kmsg.Writer{}
+	mut payload := kbin.Writer{}
 	for i, r in records {
 		if r.timestamp > max_ts {
 			max_ts = r.timestamp
@@ -66,11 +66,11 @@ pub fn build_record_batch(records []Record, opts BatchOpts) ![]u8 {
 		num_records:            records.len
 		records:                compressed
 	}
-	mut w := kmsg.Writer{}
+	mut w := kbin.Writer{}
 	batch.write_to(mut w)
 	// crc32c over everything after the crc field
 	crc := crc32.sum_crc32c(w.buf[batch_header_before_crc + 4..])
-	mut cw := kmsg.Writer{}
+	mut cw := kbin.Writer{}
 	cw.write_uint32(crc)
 	for i in 0 .. 4 {
 		w.buf[batch_header_before_crc + i] = cw.buf[i]
@@ -90,13 +90,13 @@ fn batch_attributes(opts BatchOpts) i16 {
 }
 
 // is_transactional reports attribute bit 4 of a parsed batch.
-pub fn is_transactional(batch RecordBatch) bool {
+pub fn is_transactional(batch kmsg.RecordBatch) bool {
 	return int(batch.attributes) & (1 << 4) != 0
 }
 
 // is_control reports attribute bit 5 of a parsed batch: a transaction
 // marker batch.
-pub fn is_control(batch RecordBatch) bool {
+pub fn is_control(batch kmsg.RecordBatch) bool {
 	return int(batch.attributes) & (1 << 5) != 0
 }
 
@@ -105,16 +105,16 @@ pub fn is_control(batch RecordBatch) bool {
 pub struct ParsedBatch {
 pub mut:
 	batch   kmsg.RecordBatch
-	records []kmsg.Record
+	records []Record
 }
 
 // parse_batches_meta splits and parses a Fetch payload into batches with
 // metadata. A trailing partial batch is ignored, per protocol.
 pub fn parse_batches_meta(buf []u8) ![]ParsedBatch {
-	mut out := []kmsg.ParsedBatch{}
+	mut out := []ParsedBatch{}
 	mut off := 0
 	for buf.len - off >= 12 {
-		mut hr := kmsg.Reader{
+		mut hr := kbin.Reader{
 			src: buf[off + 8..off + 12].clone()
 		}
 		total := 12 + hr.read_int32()
@@ -122,7 +122,7 @@ pub fn parse_batches_meta(buf []u8) ![]ParsedBatch {
 			break
 		}
 		batch, recs := parse_record_batch(buf[off..off + total].clone())!
-		out << kmsg.ParsedBatch{
+		out << ParsedBatch{
 			batch:   batch
 			records: recs
 		}
@@ -139,12 +139,12 @@ pub fn control_marker_batch(base_offset i64, producer_id i64, producer_epoch i16
 	// coordinator epoch int32 0
 	key := [u8(0), 0, 0, marker_type]
 	value := [u8(0), 0, 0, 0, 0, 0]
-	rec := kmsg.Record{
+	rec := Record{
 		key:       key
 		value:     value
 		timestamp: timestamp
 	}
-	return build_record_batch([rec], kmsg.BatchOpts{
+	return build_record_batch([rec], BatchOpts{
 		base_offset:    base_offset
 		producer_id:    producer_id
 		producer_epoch: producer_epoch
@@ -164,7 +164,7 @@ pub fn control_marker_is_commit(rec Record) ?bool {
 
 // BatchCrcError reports a record batch whose CRC-32C did not match.
 pub struct BatchCrcError {
-	kmsg.Error
+	Error
 pub:
 	want u32
 	got  u32
@@ -178,9 +178,9 @@ pub fn (e BatchCrcError) msg() string {
 // parse_record_batch decodes and verifies one RecordBatch: CRC first, then
 // decompression, then records. Returns the batch metadata and records with
 // absolute offsets/timestamps.
-pub fn parse_record_batch(buf []u8) !(RecordBatch, []Record) {
+pub fn parse_record_batch(buf []u8) !(kmsg.RecordBatch, []Record) {
 	mut batch := kmsg.RecordBatch{}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: buf
 	}
 	batch.read_from(mut r)!
@@ -190,27 +190,27 @@ pub fn parse_record_batch(buf []u8) !(RecordBatch, []Record) {
 	want := u32(batch.crc)
 	got := crc32.sum_crc32c(buf[batch_header_before_crc + 4..r.off])
 	if want != got {
-		return kmsg.BatchCrcError{
+		return BatchCrcError{
 			want: want
 			got:  got
 		}
 	}
 	codec_bits := int(batch.attributes) & 0x07
 	codec := match codec_bits {
-		0 { kmsg.Codec.uncompressed }
-		1 { kmsg.Codec.gzip }
-		2 { kmsg.Codec.snappy }
-		3 { kmsg.Codec.lz4 }
-		4 { kmsg.Codec.zstd }
+		0 { Codec.uncompressed }
+		1 { Codec.gzip }
+		2 { Codec.snappy }
+		3 { Codec.lz4 }
+		4 { Codec.zstd }
 		else { return error('unknown compression bits ${codec_bits}') }
 	}
 
 	payload := decompress_payload(codec, batch.records)!
 
-	mut pr := kmsg.Reader{
+	mut pr := kbin.Reader{
 		src: payload
 	}
-	mut records := []kmsg.Record{cap: batch.num_records}
+	mut records := []Record{cap: batch.num_records}
 	for _ in 0 .. batch.num_records {
 		records << decode_record(mut pr, batch.first_offset, batch.first_timestamp)!
 	}
@@ -224,7 +224,7 @@ pub fn parse_record_batch(buf []u8) !(RecordBatch, []Record) {
 // concatenated record batches, skipping control batches. A trailing
 // partial batch (brokers may cut responses mid-batch) is ignored.
 pub fn parse_record_batches(buf []u8) ![]Record {
-	mut out := []kmsg.Record{}
+	mut out := []Record{}
 	for pb in parse_batches_meta(buf)! {
 		if is_control(pb.batch) {
 			continue

@@ -25,7 +25,7 @@ fn test_murmur2_kafka_vectors() {
 }
 
 fn test_partitioners() {
-	mut kp := krec.KafkaPartitioner{}
+	mut kp := KafkaPartitioner{}
 	keyed := krec.Record{
 		key: 'foobar'.bytes()
 	}
@@ -40,7 +40,7 @@ fn test_partitioners() {
 	second := kp.partition(&keyless, 4)
 	assert second == (first + 1) % 4
 
-	mut rr := krec.RoundRobinPartitioner{}
+	mut rr := RoundRobinPartitioner{}
 	assert rr.partition(&keyed, 3) == 0
 	assert rr.partition(&keyed, 3) == 1
 	assert rr.partition(&keyed, 3) == 2
@@ -132,8 +132,8 @@ fn test_batch_crc_tamper_detected() {
 // ---------------------------------------------------------------------------
 
 fn test_produce_end_to_end() {
-	mut cl := krec.start(1, krec.ClusterCfg{})
-	mut c := new_client(krec.Config{
+	mut cl := kfake.start(1, kfake.ClusterCfg{})
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -207,8 +207,8 @@ fn test_produce_end_to_end() {
 
 fn test_produce_all_codecs_through_wire() {
 	for codec in [krec.Codec.uncompressed, .gzip, .snappy, .zstd] {
-		mut cl := krec.start(1, krec.ClusterCfg{})
-		mut c := new_client(krec.Config{
+		mut cl := kfake.start(1, kfake.ClusterCfg{})
+		mut c := new_client(Config{
 			seed_brokers: [cl.seed_addr()]
 			compression:  codec
 		}) or {
@@ -231,10 +231,10 @@ fn test_produce_all_codecs_through_wire() {
 
 fn test_produce_multi_partition_multi_leader() {
 	// 3 nodes, 6 partitions; leader(p) = p % 3
-	mut cl := krec.start(3, krec.ClusterCfg{
+	mut cl := kfake.start(3, kfake.ClusterCfg{
 		partitions_per_topic: 6
 	})
-	mut c := new_client(krec.Config{
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -282,10 +282,10 @@ fn test_produce_multi_partition_multi_leader() {
 }
 
 fn test_produce_partition_error_surfaces() {
-	mut cl := krec.start(1, krec.ClusterCfg{
+	mut cl := kfake.start(1, kfake.ClusterCfg{
 		produce_error_code: 6 // NOT_LEADER_FOR_PARTITION
 	})
-	mut c := new_client(krec.Config{
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -300,8 +300,8 @@ fn test_produce_partition_error_surfaces() {
 		},
 	]
 	c.produce('t', mut records) or {
-		assert err is krec.ProduceError
-		if err is krec.ProduceError {
+		assert err is ProduceError
+		if err is ProduceError {
 			assert err.code == 6
 			assert err.detail.contains('NOT_LEADER')
 		}
@@ -311,8 +311,8 @@ fn test_produce_partition_error_surfaces() {
 }
 
 fn test_produce_empty_and_timestamp_defaulting() {
-	mut cl := krec.start(1, krec.ClusterCfg{})
-	mut c := new_client(krec.Config{
+	mut cl := kfake.start(1, kfake.ClusterCfg{})
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -342,8 +342,8 @@ fn test_produce_empty_and_timestamp_defaulting() {
 }
 
 fn test_topic_id_registry_and_lifted_versions() {
-	mut cl := krec.start(1, krec.ClusterCfg{})
-	mut c := new_client(krec.Config{
+	mut cl := kfake.start(1, kfake.ClusterCfg{})
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -376,9 +376,9 @@ fn test_topic_id_registry_and_lifted_versions() {
 fn pipeline_worker(mut c Client, n int, results chan int) {
 	mut ok := 0
 	for i in 0 .. n {
-		mut req := krec.MetadataRequest{
+		mut req := kmsg.MetadataRequest{
 			topics: [
-				krec.MetadataRequestTopic{
+				kmsg.MetadataRequestTopic{
 					topic: 'pipe-${i}'
 				},
 			]
@@ -391,8 +391,8 @@ fn pipeline_worker(mut c Client, n int, results chan int) {
 }
 
 fn test_pipelining_single_connection_per_class() {
-	mut cl := krec.start(1, krec.ClusterCfg{})
-	mut c := new_client(krec.Config{
+	mut cl := kfake.start(1, kfake.ClusterCfg{})
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -418,10 +418,10 @@ fn test_pipelining_single_connection_per_class() {
 }
 
 fn test_fetch_longpoll_does_not_block_other_requests() {
-	mut cl := krec.start(1, krec.ClusterCfg{
+	mut cl := kfake.start(1, kfake.ClusterCfg{
 		fetch_delay: 500 * time.millisecond
 	})
-	mut c := new_client(krec.Config{
+	mut c := new_client(Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 800 * time.millisecond
 	}) or {
@@ -440,7 +440,7 @@ fn test_fetch_longpoll_does_not_block_other_requests() {
 		assert false, '${err}'
 		return
 	}
-	mut co := c.new_consumer(['slow'], krec.ConsumerOpts{}) or {
+	mut co := c.new_consumer(['slow'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -455,9 +455,9 @@ fn test_fetch_longpoll_does_not_block_other_requests() {
 
 	// ...must not delay a metadata request on the normal connection
 	start := time.now()
-	mut req := krec.MetadataRequest{
+	mut req := kmsg.MetadataRequest{
 		topics: [
-			krec.MetadataRequestTopic{
+			kmsg.MetadataRequestTopic{
 				topic: 'slow'
 			},
 		]
@@ -477,10 +477,10 @@ fn test_inflight_failure_recovery() {
 	// every connection dies after serving 3 requests; pipelined
 	// in-flights fail retriably and the client recovers on fresh
 	// connections
-	mut cl := krec.start(1, krec.ClusterCfg{
+	mut cl := kfake.start(1, kfake.ClusterCfg{
 		kill_after_requests: 3
 	})
-	mut c := new_client(krec.Config{
+	mut c := new_client(Config{
 		seed_brokers:      [cl.seed_addr()]
 		retry_backoff_min: 5 * time.millisecond
 		retry_backoff_max: 10 * time.millisecond
@@ -492,9 +492,9 @@ fn test_inflight_failure_recovery() {
 		c.close()
 	}
 	for i in 0 .. 10 {
-		mut req := krec.MetadataRequest{
+		mut req := kmsg.MetadataRequest{
 			topics: [
-				krec.MetadataRequestTopic{
+				kmsg.MetadataRequestTopic{
 					topic: 'r-${i}'
 				},
 			]

@@ -24,7 +24,7 @@ pub:
 pub struct PromisedReq {
 pub:
 	req  kmsg.Request
-	resp chan kmsg.PromisedResp
+	resp chan PromisedResp
 }
 
 // Broker is a handle to one broker's worker loop. Obtain it from
@@ -33,20 +33,20 @@ pub:
 @[heap]
 pub struct Broker {
 pub:
-	meta kmsg.BrokerMetadata
+	meta BrokerMetadata
 pub mut:
-	cfg    kmsg.Config
-	cancel &kmsg.Cancel
-	reqs   chan kmsg.PromisedReq
+	cfg    Config
+	cancel &Cancel
+	reqs   chan PromisedReq
 }
 
 // new_broker returns a Broker handle for the given address.
 pub fn new_broker(meta BrokerMetadata, cfg Config, cancel &Cancel) &Broker {
-	return &kmsg.Broker{
+	return &Broker{
 		meta:   meta
 		cfg:    cfg
 		cancel: cancel
-		reqs:   chan kmsg.PromisedReq{cap: 128}
+		reqs:   chan PromisedReq{cap: 128}
 	}
 }
 
@@ -59,14 +59,14 @@ pub fn (mut b Broker) start() {
 // PromisedResp (including the retriable classification). Selecting on
 // cancel at both steps ensures callers never hang once the broker (or
 // client) is shut down.
-pub fn (b &Broker) promise(req Request) PromisedResp {
-	resp_ch := chan kmsg.PromisedResp{cap: 1}
-	preq := kmsg.PromisedReq{
+pub fn (b &Broker) promise(req kmsg.Request) PromisedResp {
+	resp_ch := chan PromisedResp{cap: 1}
+	preq := PromisedReq{
 		req:  req
 		resp: resp_ch
 	}
-	closed := kmsg.PromisedResp{
-		err_msg: kmsg.ClientClosedError{}.msg()
+	closed := PromisedResp{
+		err_msg: ClientClosedError{}.msg()
 	}
 	select {
 		b.reqs <- preq {}
@@ -87,7 +87,7 @@ pub fn (b &Broker) promise(req Request) PromisedResp {
 
 // request is promise() reduced to a Result: the raw response body on
 // success. Decode it with the matching kmsg response type at req.version.
-pub fn (b &Broker) request(req Request) ![]u8 {
+pub fn (b &Broker) request(req kmsg.Request) ![]u8 {
 	resp := b.promise(req)
 	if body := resp.body {
 		return body
@@ -107,9 +107,9 @@ enum ConnClass {
 
 fn class_for_key(key i16) ConnClass {
 	return match key {
-		1 { kmsg.ConnClass.fetch }
-		8, 9, 10, 11, 12, 13, 14 { kmsg.ConnClass.coord }
-		else { kmsg.ConnClass.normal }
+		1 { ConnClass.fetch }
+		8, 9, 10, 11, 12, 13, 14 { ConnClass.coord }
+		else { ConnClass.normal }
 	}
 }
 
@@ -118,7 +118,7 @@ struct Inflight {
 	corr     int
 	flexible bool
 	key      i16
-	resp     chan kmsg.PromisedResp
+	resp     chan PromisedResp
 }
 
 // ConnState is one pipelined connection: the writer appends to inflight
@@ -129,7 +129,7 @@ struct Inflight {
 struct ConnState {
 mut:
 	conn      &net.TcpConn
-	inflight  chan kmsg.Inflight
+	inflight  chan Inflight
 	mu        &sync.Mutex = sync.new_mutex()
 	dead      bool // set by reader on transport/correlation failure
 	closed    bool // set by writer once socket + channel are closed
@@ -137,7 +137,7 @@ mut:
 }
 
 fn (mut b Broker) run() {
-	mut conns := map[int]&kmsg.ConnState{}
+	mut conns := map[int]&ConnState{}
 	defer {
 		for _, mut st in conns {
 			b.close_state(mut st)
@@ -154,8 +154,8 @@ fn (mut b Broker) run() {
 				for {
 					select {
 						preq := <-b.reqs {
-							preq.resp <- kmsg.PromisedResp{
-								err_msg: kmsg.ClientClosedError{}.msg()
+							preq.resp <- PromisedResp{
+								err_msg: ClientClosedError{}.msg()
 							}
 						}
 						else {
@@ -188,16 +188,16 @@ fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
 	mut st := conns[idx] or {
 		conn := dial_broker(b.meta, mut b.cfg) or {
 			b.cfg.log(.warn, 'dial ${b.meta.addr()} failed: ${err.msg()}')
-			preq.resp <- kmsg.PromisedResp{
+			preq.resp <- PromisedResp{
 				err_msg:   err.msg()
 				retriable: true
 			}
 			return
 		}
 		b.cfg.log(.debug, 'connected to ${b.meta.addr()} (${class})')
-		mut nst := &kmsg.ConnState{
+		mut nst := &ConnState{
 			conn:     conn
-			inflight: chan kmsg.Inflight{cap: b.cfg.max_inflight}
+			inflight: chan Inflight{cap: b.cfg.max_inflight}
 		}
 		spawn b.reader(mut nst)
 		conns[idx] = nst
@@ -214,8 +214,8 @@ fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
 		}
 		b.close_state(mut st)
 		conns.delete(idx)
-		preq.resp <- kmsg.PromisedResp{
-			err_msg:   kmsg.BrokerConnError{
+		preq.resp <- PromisedResp{
+			err_msg:   BrokerConnError{
 				host:   b.meta.addr()
 				detail: err.msg()
 			}.msg()
@@ -228,7 +228,7 @@ fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
 	}
 	// registering after the write is safe: the reader takes the entry
 	// first and only then reads the socket
-	st.inflight <- kmsg.Inflight{
+	st.inflight <- Inflight{
 		corr:     corr
 		flexible: response_header_is_flexible(preq.req)
 		key:      preq.req.key()
@@ -245,7 +245,7 @@ fn (mut b Broker) reader(mut st ConnState) {
 	for {
 		entry := <-st.inflight or { break } // closed by writer: exit
 		if failed {
-			entry.resp <- kmsg.PromisedResp{
+			entry.resp <- PromisedResp{
 				err_msg:   fail_msg
 				retriable: true
 			}
@@ -257,16 +257,16 @@ fn (mut b Broker) reader(mut st ConnState) {
 				h.on_broker_read(b.meta, entry.key, 0, time.now() - rstart, false)
 			}
 			failed = true
-			fail_msg = kmsg.BrokerConnError{
+			fail_msg = BrokerConnError{
 				host:   b.meta.addr()
 				detail: err.msg()
 			}.msg()
 			st.mu.lock()
 			st.dead = true
 			st.mu.unlock()
-			entry.resp <- kmsg.PromisedResp{
+			entry.resp <- PromisedResp{
 				err_msg:   fail_msg
-				retriable: err !is kmsg.ResponseTooLargeError
+				retriable: err !is ResponseTooLargeError
 			}
 			continue
 		}
@@ -280,13 +280,13 @@ fn (mut b Broker) reader(mut st ConnState) {
 			st.mu.lock()
 			st.dead = true
 			st.mu.unlock()
-			entry.resp <- kmsg.PromisedResp{
+			entry.resp <- PromisedResp{
 				err_msg:   fail_msg
 				retriable: true
 			}
 			continue
 		}
-		entry.resp <- kmsg.PromisedResp{
+		entry.resp <- PromisedResp{
 			body: body
 		}
 	}
@@ -312,7 +312,7 @@ fn (mut b Broker) close_state(mut st ConnState) {
 
 // request_api_versions negotiates ApiVersions with the broker and returns
 // the parsed response; the first step of the client request path.
-pub fn (b &Broker) request_api_versions() !ApiVersionsResponse {
+pub fn (b &Broker) request_api_versions() !kmsg.ApiVersionsResponse {
 	mut req := kmsg.ApiVersionsRequest{
 		version:                 3
 		client_software_name:    b.cfg.software_name
@@ -322,7 +322,7 @@ pub fn (b &Broker) request_api_versions() !ApiVersionsResponse {
 	mut resp := kmsg.ApiVersionsResponse{
 		version: req.version
 	}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!

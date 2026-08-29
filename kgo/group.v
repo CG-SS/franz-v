@@ -25,7 +25,7 @@ pub struct GroupOpts {
 pub mut:
 	// balancers is the assignment-strategy preference order offered on
 	// join; the coordinator picks the first supported by all members.
-	balancers []kmsg.BalancerKind = [kmsg.BalancerKind.range_bal, .round_robin]
+	balancers []BalancerKind = [BalancerKind.range_bal, .round_robin]
 	// session_timeout is how long the coordinator waits for a heartbeat
 	// before evicting the member.
 	session_timeout time.Duration = 45 * time.second
@@ -35,7 +35,7 @@ pub mut:
 	// heartbeat_interval is how often poll sends heartbeats.
 	heartbeat_interval time.Duration = 3 * time.second
 	// start is where partitions without a committed offset begin.
-	start kmsg.StartOffset = .earliest
+	start StartOffset = .earliest
 }
 
 // GroupConsumer consumes topics as a member of a consumer group. Obtain
@@ -49,16 +49,16 @@ pub mut:
 @[heap]
 pub struct GroupConsumer {
 pub mut:
-	client &kmsg.Client
+	client &Client
 	group  string
 	topics []string
-	opts   kmsg.GroupOpts
+	opts   GroupOpts
 mut:
 	coordinator    int = -2147483648 // none
 	member_id      string
 	generation     int = -1
 	assignment     map[string][]int // topic -> partitions
-	inner          ?&kmsg.Consumer
+	inner          ?&Consumer
 	needs_rejoin   bool = true
 	last_heartbeat i64 // unix microseconds
 }
@@ -73,7 +73,7 @@ pub fn (mut c Client) new_group_consumer(group string, topics []string, opts Gro
 		return error('at least one topic is required')
 	}
 	c.metadata(topics)!
-	return &kmsg.GroupConsumer{
+	return &GroupConsumer{
 		client: c
 		group:  group
 		topics: topics
@@ -110,7 +110,7 @@ fn (mut g GroupConsumer) find_coordinator() ! {
 		mut resp := kmsg.FindCoordinatorResponse{
 			version: req.version
 		}
-		mut r := kmsg.Reader{
+		mut r := kbin.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
@@ -124,7 +124,7 @@ fn (mut g GroupConsumer) find_coordinator() ! {
 				time.sleep(250 * time.millisecond)
 			}
 			else {
-				e := kmsg.error_for_code(resp.error_code) or { kmsg.unknown_server_error }
+				e := kerr.error_for_code(resp.error_code) or { kerr.unknown_server_error }
 				return error('find coordinator: ${e.msg()}')
 			}
 		}
@@ -134,10 +134,10 @@ fn (mut g GroupConsumer) find_coordinator() ! {
 
 // request_capped is request() with a version cap, for shape-changing APIs
 // (coordinator lookups, raw fetches to brokers without known topic ids).
-pub fn (mut c Client) request_capped(mut req Request, cap i16) ![]u8 {
+pub fn (mut c Client) request_capped(mut req kmsg.Request, cap i16) ![]u8 {
 	mut attempt := 0
 	for {
-		mut b := c.any_broker() or { return kmsg.NoBrokersError{} }
+		mut b := c.any_broker() or { return NoBrokersError{} }
 		res := c.request_on(mut b, mut req, cap)
 		if body := res.body {
 			return body
@@ -148,10 +148,10 @@ pub fn (mut c Client) request_capped(mut req Request, cap i16) ![]u8 {
 		attempt++
 		time.sleep(c.cfg.backoff_for(attempt - 1))
 		if c.cancel.is_done() {
-			return kmsg.ClientClosedError{}
+			return ClientClosedError{}
 		}
 	}
-	return kmsg.NoBrokersError{}
+	return NoBrokersError{}
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +172,7 @@ fn (g &GroupConsumer) member_metadata() []u8 {
 			partitions: g.assignment[t].clone()
 		}
 	}
-	mut w := kmsg.Writer{}
+	mut w := kbin.Writer{}
 	meta.write_to(mut w)
 	return w.buf
 }
@@ -213,7 +213,7 @@ fn (mut g GroupConsumer) join_and_sync() ! {
 		mut jresp := kmsg.JoinGroupResponse{
 			version: jreq.version
 		}
-		mut jr := kmsg.Reader{
+		mut jr := kbin.Reader{
 			src: jbody
 		}
 		jresp.read_from(mut jr)!
@@ -241,7 +241,7 @@ fn (mut g GroupConsumer) join_and_sync() ! {
 				continue
 			}
 			else {
-				e := kmsg.error_for_code(jresp.error_code) or { kmsg.unknown_server_error }
+				e := kerr.error_for_code(jresp.error_code) or { kerr.unknown_server_error }
 				return error('join group: ${e.msg()}')
 			}
 		}
@@ -273,7 +273,7 @@ fn (mut g GroupConsumer) join_and_sync() ! {
 		mut sresp := kmsg.SyncGroupResponse{
 			version: sreq.version
 		}
-		mut sr := kmsg.Reader{
+		mut sr := kbin.Reader{
 			src: sbody
 		}
 		sresp.read_from(mut sr)!
@@ -287,13 +287,13 @@ fn (mut g GroupConsumer) join_and_sync() ! {
 				continue
 			}
 			else {
-				e := kmsg.error_for_code(sresp.error_code) or { kmsg.unknown_server_error }
+				e := kerr.error_for_code(sresp.error_code) or { kerr.unknown_server_error }
 				return error('sync group: ${e.msg()}')
 			}
 		}
 
 		mut assigned := kmsg.ConsumerMemberAssignment{}
-		mut ar := kmsg.Reader{
+		mut ar := kbin.Reader{
 			src: sresp.member_assignment
 		}
 		assigned.read_from(mut ar)!
@@ -347,16 +347,16 @@ fn (mut g GroupConsumer) join_and_sync() ! {
 
 // lead_assignments runs the chosen balancer over all members' decoded
 // subscriptions (leader only).
-fn (mut g GroupConsumer) lead_assignments(chosen_name string, members []JoinGroupResponseMember) ![]SyncGroupRequestGroupAssignment {
+fn (mut g GroupConsumer) lead_assignments(chosen_name string, members []kmsg.JoinGroupResponseMember) ![]kmsg.SyncGroupRequestGroupAssignment {
 	kind := balancer_for_name(chosen_name) or {
 		return error('coordinator chose unsupported protocol ${chosen_name}')
 	}
 	mut c := g.client
-	mut subs := []kmsg.MemberSubscription{cap: members.len}
+	mut subs := []MemberSubscription{cap: members.len}
 	mut all_topics := map[string]bool{}
 	for m in members {
 		mut meta := kmsg.ConsumerMemberMetadata{}
-		mut r := kmsg.Reader{
+		mut r := kbin.Reader{
 			src: m.protocol_metadata
 		}
 		meta.read_from(mut r)!
@@ -364,7 +364,7 @@ fn (mut g GroupConsumer) lead_assignments(chosen_name string, members []JoinGrou
 		for op in meta.owned_partitions {
 			owned[op.topic] = op.partitions.clone()
 		}
-		subs << kmsg.MemberSubscription{
+		subs << MemberSubscription{
 			member_id:  m.member_id
 			topics:     meta.topics.clone()
 			owned:      owned
@@ -394,7 +394,7 @@ fn (mut g GroupConsumer) lead_assignments(chosen_name string, members []JoinGrou
 				partitions: per_topic[t].clone()
 			}
 		}
-		mut w := kmsg.Writer{}
+		mut w := kbin.Writer{}
 		asg.write_to(mut w)
 		out << kmsg.SyncGroupRequestGroupAssignment{
 			member_id:         member_id
@@ -431,7 +431,7 @@ fn (mut g GroupConsumer) position_at_committed(preserve map[string]i64) ! {
 	mut resp := kmsg.OffsetFetchResponse{
 		version: req.version
 	}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -442,7 +442,7 @@ fn (mut g GroupConsumer) position_at_committed(preserve map[string]i64) ! {
 	for t in resp.topics {
 		for p in t.partitions {
 			if p.error_code != 0 {
-				e := kmsg.error_for_code(p.error_code) or { kmsg.unknown_server_error }
+				e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
 				return error('offset fetch ${t.topic}[${p.partition}]: ${e.msg()}')
 			}
 			if p.offset >= 0 {
@@ -473,7 +473,7 @@ fn (mut g GroupConsumer) position_at_committed(preserve map[string]i64) ! {
 	for k, v in preserve {
 		cursors[k] = v
 	}
-	g.inner = &kmsg.Consumer{
+	g.inner = &Consumer{
 		client:  c
 		cursors: cursors
 	}
@@ -525,7 +525,7 @@ pub fn (mut g GroupConsumer) commit() ! {
 	mut resp := kmsg.OffsetCommitResponse{
 		version: req.version
 	}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -536,7 +536,7 @@ pub fn (mut g GroupConsumer) commit() ! {
 					ec_rebalance_in_progress] {
 					g.needs_rejoin = true
 				}
-				e := kmsg.error_for_code(p.error_code) or { kmsg.unknown_server_error }
+				e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
 				return error('offset commit ${t.topic}[${p.partition}]: ${e.msg()}')
 			}
 		}
@@ -567,7 +567,7 @@ fn (mut g GroupConsumer) maybe_heartbeat() ! {
 	mut resp := kmsg.HeartbeatResponse{
 		version: req.version
 	}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -586,7 +586,7 @@ fn (mut g GroupConsumer) maybe_heartbeat() ! {
 			g.needs_rejoin = true
 		}
 		else {
-			e := kmsg.error_for_code(resp.error_code) or { kmsg.unknown_server_error }
+			e := kerr.error_for_code(resp.error_code) or { kerr.unknown_server_error }
 			return error('heartbeat: ${e.msg()}')
 		}
 	}

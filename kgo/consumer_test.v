@@ -4,9 +4,9 @@ import kfake
 import time
 
 fn produce_n(mut c Client, topic string, n int, prefix string) []Record {
-	mut records := []kfake.Record{}
+	mut records := []Record{}
 	for i in 0 .. n {
-		records << kfake.Record{
+		records << Record{
 			key:   '${prefix}-k${i}'.bytes()
 			value: '${prefix}-v${i}'.bytes()
 		}
@@ -17,7 +17,7 @@ fn produce_n(mut c Client, topic string, n int, prefix string) []Record {
 
 fn test_consume_from_earliest_and_advance() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{})
-	mut c := new_client(kfake.Config{
+	mut c := new_client(Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond
 	}) or {
@@ -29,7 +29,7 @@ fn test_consume_from_earliest_and_advance() {
 	}
 	produce_n(mut c, 'events', 5, 'a')
 
-	mut co := c.new_consumer(['events'], kfake.ConsumerOpts{}) or {
+	mut co := c.new_consumer(['events'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -74,7 +74,7 @@ fn test_consume_from_earliest_and_advance() {
 
 fn test_consume_from_latest() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{})
-	mut c := new_client(kfake.Config{
+	mut c := new_client(Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond
 	}) or {
@@ -86,7 +86,7 @@ fn test_consume_from_latest() {
 	}
 	produce_n(mut c, 'events', 3, 'old')
 
-	mut co := c.new_consumer(['events'], kfake.ConsumerOpts{
+	mut co := c.new_consumer(['events'], ConsumerOpts{
 		start: .latest
 	}) or {
 		assert false, '${err}'
@@ -113,7 +113,7 @@ fn test_consume_multi_partition_multi_leader() {
 	mut cl := kfake.start(3, kfake.ClusterCfg{
 		partitions_per_topic: 6
 	})
-	mut c := new_client(kfake.Config{
+	mut c := new_client(Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond
 	}) or {
@@ -123,10 +123,10 @@ fn test_consume_multi_partition_multi_leader() {
 	defer {
 		c.close()
 	}
-	mut records := []kfake.Record{}
+	mut records := []Record{}
 	for p in 0 .. 6 {
 		for i in 0 .. 3 {
-			records << kfake.Record{
+			records << Record{
 				partition: p
 				value:     'p${p}-i${i}'.bytes()
 			}
@@ -137,7 +137,7 @@ fn test_consume_multi_partition_multi_leader() {
 		return
 	}
 
-	mut co := c.new_consumer(['spread'], kfake.ConsumerOpts{}) or {
+	mut co := c.new_consumer(['spread'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -160,7 +160,7 @@ fn test_consume_multi_partition_multi_leader() {
 
 fn test_seek_replays() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{})
-	mut c := new_client(kfake.Config{
+	mut c := new_client(Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond
 	}) or {
@@ -171,7 +171,7 @@ fn test_seek_replays() {
 		c.close()
 	}
 	produce_n(mut c, 'events', 4, 'x')
-	mut co := c.new_consumer(['events'], kfake.ConsumerOpts{}) or {
+	mut co := c.new_consumer(['events'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -194,7 +194,7 @@ fn test_seek_replays() {
 
 fn test_offset_out_of_range_resets() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{})
-	mut c := new_client(kfake.Config{
+	mut c := new_client(Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond
 	}) or {
@@ -205,7 +205,7 @@ fn test_offset_out_of_range_resets() {
 		c.close()
 	}
 	produce_n(mut c, 'events', 3, 'r')
-	mut co := c.new_consumer(['events'], kfake.ConsumerOpts{}) or {
+	mut co := c.new_consumer(['events'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}
@@ -228,7 +228,7 @@ fn test_offset_out_of_range_resets() {
 
 fn test_consume_compressed() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{})
-	mut c := new_client(kfake.Config{
+	mut c := new_client(Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond
 		compression:    .gzip
@@ -240,7 +240,7 @@ fn test_consume_compressed() {
 		c.close()
 	}
 	produce_n(mut c, 'zipped', 3, 'g')
-	mut co := c.new_consumer(['zipped'], kfake.ConsumerOpts{}) or {
+	mut co := c.new_consumer(['zipped'], ConsumerOpts{}) or {
 		assert false, '${err}'
 		return
 	}

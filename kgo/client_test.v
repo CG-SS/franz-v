@@ -30,7 +30,7 @@ struct ClusterCfg {
 }
 
 struct FakeCluster {
-	cfg kmsg.ClusterCfg
+	cfg ClusterCfg
 mut:
 	mu        &sync.Mutex = sync.new_mutex()
 	ports     []int
@@ -39,7 +39,7 @@ mut:
 }
 
 fn start_cluster(nodes int, cfg ClusterCfg) &FakeCluster {
-	mut cl := &kmsg.FakeCluster{
+	mut cl := &FakeCluster{
 		cfg: cfg
 	}
 	cl.fails = cfg.fail_first_conns
@@ -80,7 +80,7 @@ fn (mut cl FakeCluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			conn.close() or {}
 			return
 		}
-		mut sr := kmsg.Reader{
+		mut sr := kbin.Reader{
 			src: size_buf
 		}
 		size := sr.read_int32()
@@ -90,7 +90,7 @@ fn (mut cl FakeCluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			return
 		}
 
-		mut r := kmsg.Reader{
+		mut r := kbin.Reader{
 			src: payload
 		}
 		key := r.read_int16()
@@ -118,12 +118,12 @@ fn (mut cl FakeCluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			else { []u8{} }
 		}
 
-		mut hdr := kmsg.Writer{}
+		mut hdr := kbin.Writer{}
 		hdr.write_int32(corr)
 		if flexible && key != 18 {
 			hdr.write_uvarint(0)
 		}
-		mut framed := kmsg.Writer{}
+		mut framed := kbin.Writer{}
 		framed.write_int32(hdr.buf.len + resp_body.len)
 		framed.buf << hdr.buf
 		framed.buf << resp_body
@@ -134,7 +134,7 @@ fn (mut cl FakeCluster) serve_conn(node_id int, mut conn net.TcpConn) {
 	}
 }
 
-fn (cl &FakeCluster) api_keys() []ApiVersionsResponseApiKey {
+fn (cl &FakeCluster) api_keys() []kmsg.ApiVersionsResponseApiKey {
 	mut keys := []kmsg.ApiVersionsResponseApiKey{}
 	for k, v in cl.cfg.advertised {
 		keys << kmsg.ApiVersionsResponseApiKey{
@@ -154,7 +154,7 @@ fn (mut cl FakeCluster) answer_api_versions(body []u8, version i16) []u8 {
 			error_code: 35
 			api_keys:   cl.api_keys()
 		}
-		mut w := kmsg.Writer{}
+		mut w := kbin.Writer{}
 		resp.write_to(mut w)
 		return w.buf
 	}
@@ -162,7 +162,7 @@ fn (mut cl FakeCluster) answer_api_versions(body []u8, version i16) []u8 {
 		version:  version
 		api_keys: cl.api_keys()
 	}
-	mut w := kmsg.Writer{}
+	mut w := kbin.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -171,7 +171,7 @@ fn (mut cl FakeCluster) answer_metadata(node_id int, body []u8, version i16) []u
 	mut req := kmsg.MetadataRequest{
 		version: version
 	}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -200,7 +200,7 @@ fn (mut cl FakeCluster) answer_metadata(node_id int, body []u8, version i16) []u
 			port:    port
 		}
 	}
-	mut w := kmsg.Writer{}
+	mut w := kbin.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -209,11 +209,11 @@ fn (cl &FakeCluster) seed_addr() string {
 	return '127.0.0.1:${cl.ports[0]}'
 }
 
-fn decode_metadata(body []u8, version i16) !MetadataResponse {
+fn decode_metadata(body []u8, version i16) !kmsg.MetadataResponse {
 	mut resp := kmsg.MetadataResponse{
 		version: version
 	}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -225,8 +225,8 @@ fn decode_metadata(body []u8, version i16) !MetadataResponse {
 // ---------------------------------------------------------------------------
 
 fn test_bootstrap_discovery_and_targeted_requests() {
-	cl := start_cluster(3, kmsg.ClusterCfg{})
-	mut c := new_client(kmsg.Config{
+	cl := start_cluster(3, ClusterCfg{})
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -269,13 +269,13 @@ fn test_bootstrap_discovery_and_targeted_requests() {
 
 fn test_version_negotiation_caps() {
 	// cluster only speaks Metadata up to v9 while the client supports v13
-	cl := start_cluster(1, kmsg.ClusterCfg{
+	cl := start_cluster(1, ClusterCfg{
 		advertised: {
 			i16(3):  i16(9)
 			i16(18): i16(3)
 		}
 	})
-	mut c := new_client(kmsg.Config{
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -305,10 +305,10 @@ fn test_version_negotiation_caps() {
 
 fn test_api_versions_v0_fallback() {
 	// ancient broker: rejects ApiVersions v3 with a v0-encoded error 35
-	cl := start_cluster(1, kmsg.ClusterCfg{
+	cl := start_cluster(1, ClusterCfg{
 		api_versions_max: 0
 	})
-	mut c := new_client(kmsg.Config{
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -331,13 +331,13 @@ fn test_api_versions_v0_fallback() {
 
 fn test_unsupported_key_is_terminal() {
 	// cluster does not advertise Produce (key 0)
-	cl := start_cluster(1, kmsg.ClusterCfg{
+	cl := start_cluster(1, ClusterCfg{
 		advertised: {
 			i16(3):  i16(12)
 			i16(18): i16(3)
 		}
 	})
-	mut c := new_client(kmsg.Config{
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -357,10 +357,10 @@ fn test_unsupported_key_is_terminal() {
 
 fn test_retry_on_connection_failure() {
 	// the first two connections are accepted and dropped
-	cl := start_cluster(1, kmsg.ClusterCfg{
+	cl := start_cluster(1, ClusterCfg{
 		fail_first_conns: 2
 	})
-	mut c := new_client(kmsg.Config{
+	mut c := new_client(Config{
 		seed_brokers:      [cl.seed_addr()]
 		retry_backoff_min: 10 * time.millisecond
 		retry_backoff_max: 20 * time.millisecond
@@ -382,10 +382,10 @@ fn test_retry_on_connection_failure() {
 	}
 
 	// with retries disabled, the same failure surfaces immediately
-	cl2 := start_cluster(1, kmsg.ClusterCfg{
+	cl2 := start_cluster(1, ClusterCfg{
 		fail_first_conns: 1
 	})
-	mut c2 := new_client(kmsg.Config{
+	mut c2 := new_client(Config{
 		seed_brokers:    [cl2.seed_addr()]
 		request_retries: 0
 	}) or {
@@ -422,8 +422,8 @@ fn client_worker(mut c Client, n int, results chan int) {
 }
 
 fn test_concurrent_requests() {
-	cl := start_cluster(2, kmsg.ClusterCfg{})
-	mut c := new_client(kmsg.Config{
+	cl := start_cluster(2, ClusterCfg{})
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'
@@ -460,8 +460,8 @@ fn test_concurrent_requests() {
 }
 
 fn test_close_unblocks_and_fails_fast() {
-	cl := start_cluster(1, kmsg.ClusterCfg{})
-	mut c := new_client(kmsg.Config{
+	cl := start_cluster(1, ClusterCfg{})
+	mut c := new_client(Config{
 		seed_brokers: [cl.seed_addr()]
 	}) or {
 		assert false, '${err}'

@@ -21,7 +21,7 @@ fn main() {
 	group := 'franzv-smoke-team'
 	println('group smoke against ${addr} (topic ${topic}, group ${group})')
 
-	mut c := kmsg.new_client(kmsg.Config{
+	mut c := kgo.new_client(kgo.Config{
 		seed_brokers:   [addr]
 		fetch_max_wait: 300 * time.millisecond
 	}) or {
@@ -44,13 +44,13 @@ fn main() {
 	}
 	c.request(mut creq) or {}
 
-	opts := kmsg.GroupOpts{
+	opts := kgo.GroupOpts{
 		heartbeat_interval: 300 * time.millisecond
 		session_timeout:    10 * time.second
 	}
 	// one client per member: joins are long-polls and franz-v sends
 	// strictly in order per connection
-	mut c2 := kmsg.new_client(kmsg.Config{
+	mut c2 := kgo.new_client(kgo.Config{
 		seed_brokers:   [addr]
 		fetch_max_wait: 300 * time.millisecond
 	}) or {
@@ -71,7 +71,7 @@ fn main() {
 
 	// drive g2's blocking first join from a thread while g1 polls along
 	done := chan bool{cap: 1}
-	spawn fn (mut g2 kmsg.GroupConsumer, done chan bool) {
+	spawn fn (mut g2 kgo.GroupConsumer, done chan bool) {
 		g2.poll() or { eprintln('g2 initial poll: ${err.msg()}') }
 		done <- true
 	}(mut g2, done)
@@ -112,9 +112,9 @@ fn main() {
 	println('- rebalance settled: g1=${g1.assigned()[topic]} g2=${g2.assigned()[topic]} (real coordinator)')
 
 	// 8 records across the 4 partitions: each lands with exactly one member
-	mut records := []kmsg.Record{}
+	mut records := []kgo.Record{}
 	for i in 0 .. 8 {
-		records << kmsg.Record{
+		records << kgo.Record{
 			partition: i % 4
 			value:     'rec-${i}'.bytes()
 		}
@@ -175,9 +175,9 @@ fn main() {
 	println('- member left; survivor reclaimed all 4 partitions')
 
 	// committed offsets held: new records only
-	mut more := []kmsg.Record{}
+	mut more := []kgo.Record{}
 	for i in 0 .. 4 {
-		more << kmsg.Record{
+		more << kgo.Record{
 			partition: i
 			value:     'post-${i}'.bytes()
 		}

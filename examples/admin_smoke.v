@@ -32,11 +32,11 @@ fn main() {
 	defer {
 		c.close()
 	}
-	mut a := kgo.new(c)
+	mut a := kadm.new(c)
 
 	// ---- topics ----
 	results := a.create_topics([
-		kgo.TopicSpec{
+		kadm.TopicSpec{
 			topic:      topic
 			partitions: 2
 			configs:    {
@@ -52,7 +52,7 @@ fn main() {
 		return
 	}
 	dup := a.create_topics([
-		kgo.TopicSpec{
+		kadm.TopicSpec{
 			topic: topic
 		},
 	]) or {

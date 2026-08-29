@@ -24,14 +24,14 @@ pub mut:
 	retry_backoff_min time.Duration = 250 * time.millisecond
 	retry_backoff_max time.Duration = 2500 * time.millisecond
 	// compression selects the codec for produced record batches.
-	compression kversion.Codec = .uncompressed
+	compression Codec = .uncompressed
 	// required_acks for produce: -1 waits for all in-sync replicas,
 	// 1 for the leader only, 0 for no acknowledgment.
 	required_acks i16 = -1
 	// produce_timeout is the broker-side timeout for produce requests.
 	produce_timeout time.Duration = 10 * time.second
 	// partitioner assigns partitions to records that do not pin one.
-	partitioner kversion.Partitioner = kversion.Partitioner(kversion.KafkaPartitioner{})
+	partitioner Partitioner = Partitioner(KafkaPartitioner{})
 	// fetch_max_wait bounds how long the broker may hold a fetch waiting
 	// for fetch_min_bytes of data.
 	fetch_max_wait time.Duration = 1 * time.second
@@ -43,10 +43,10 @@ pub mut:
 	fetch_partition_max_bytes int = 1 << 20
 	// offset_reset is where a consumer resumes when its offset is out of
 	// range (compacted/truncated away).
-	offset_reset kversion.StartOffset = .earliest
+	offset_reset StartOffset = .earliest
 	// isolation_level: read_committed hides records of open and aborted
 	// transactions.
-	isolation_level kversion.IsolationLevel = .read_uncommitted
+	isolation_level IsolationLevel = .read_uncommitted
 	// max_inflight is the pipelining depth per broker connection: how
 	// many requests may await responses concurrently.
 	max_inflight int = 64
@@ -58,9 +58,9 @@ pub mut:
 	// max_versions caps the request versions the client will use.
 	max_versions kversion.Versions = kversion.stable()
 	// logger receives client logs; silent by default.
-	logger kversion.Logger = kversion.Logger(kversion.NopLogger{})
+	logger Logger = Logger(NopLogger{})
 	// hooks observe client internals.
-	hooks kversion.Hooks
+	hooks Hooks
 }
 
 // validate returns an error if the configuration is unusable.

@@ -21,11 +21,11 @@ fn fail(msg string) {
 
 // create_topic best-effort creates a single-partition topic; brokers that
 // do not support CreateTopics (e.g. kfake, which auto-creates) are fine.
-fn create_topic(mut c krec.Client, topic string) {
-	mut req := krec.CreateTopicsRequest{
+fn create_topic(mut c kgo.Client, topic string) {
+	mut req := kmsg.CreateTopicsRequest{
 		timeout_millis: 10000
 		topics:         [
-			krec.CreateTopicsRequestTopic{
+			kmsg.CreateTopicsRequestTopic{
 				topic:              topic
 				num_partitions:     1
 				replication_factor: 1
@@ -36,10 +36,10 @@ fn create_topic(mut c krec.Client, topic string) {
 		println('  create ${topic}: skipped (${err.msg()})')
 		return
 	}
-	mut resp := krec.CreateTopicsResponse{
+	mut resp := kmsg.CreateTopicsResponse{
 		version: req.version
 	}
-	mut r := krec.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r) or {
@@ -56,21 +56,21 @@ fn create_topic(mut c krec.Client, topic string) {
 
 // fetch_all fetches records from offset 0 of topic/partition 0 and parses
 // every returned batch.
-fn fetch_all(mut c krec.Client, topic string) []krec.Record {
+fn fetch_all(mut c kgo.Client, topic string) []krec.Record {
 	// use uuid addressing (Fetch v13+) when metadata taught us the id
 	tid := c.topic_id(topic) or { [16]u8{} }
-	mut req := krec.FetchRequest{
+	mut req := kmsg.FetchRequest{
 		replica_id:      -1
 		session_epoch:   -1
 		max_wait_millis: 500
 		min_bytes:       1
 		max_bytes:       1 << 20
 		topics:          [
-			krec.FetchRequestTopic{
+			kmsg.FetchRequestTopic{
 				topic:      topic
 				topic_id:   tid
 				partitions: [
-					krec.FetchRequestTopicPartition{
+					kmsg.FetchRequestTopicPartition{
 						partition:            0
 						fetch_offset:         0
 						current_leader_epoch: -1
@@ -93,10 +93,10 @@ fn fetch_all(mut c krec.Client, topic string) []krec.Record {
 			return []
 		}
 	}
-	mut resp := krec.FetchResponse{
+	mut resp := kmsg.FetchResponse{
 		version: req.version
 	}
-	mut r := krec.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r) or {
@@ -122,7 +122,7 @@ fn main() {
 	addr := if os.args.len > 1 { os.args[1] } else { '127.0.0.1:9092' }
 	println('franz-v real-broker smoke against ${addr}')
 
-	mut c := krec.new_client(krec.Config{
+	mut c := kgo.new_client(kgo.Config{
 		seed_brokers: [addr]
 	}) or {
 		fail('client: ${err.msg()}')
@@ -139,7 +139,7 @@ fn main() {
 	println('  connected: cluster ${cluster}, ${meta.brokers.len} broker(s)')
 	for key in [i16(0), 1, 3, 19] {
 		v := c.negotiated_version(addr, key) or { i16(-1) }
-		println('  negotiated ${krec.name_for_key(key)}: v${v}')
+		println('  negotiated ${kmsg.name_for_key(key)}: v${v}')
 	}
 
 	codecs := [krec.Codec.uncompressed, .gzip, .snappy, .zstd]
@@ -201,7 +201,7 @@ fn main() {
 	// Consumer API: consume everything just produced across all topics
 	// ------------------------------------------------------------------
 	topics := codecs.map('franzv-smoke-${it}')
-	mut co := c.new_consumer(topics, krec.ConsumerOpts{}) or {
+	mut co := c.new_consumer(topics, kgo.ConsumerOpts{}) or {
 		fail('new_consumer: ${err.msg()}')
 		return
 	}

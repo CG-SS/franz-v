@@ -25,7 +25,7 @@ fn main() {
 	group := 'franzv-coop-team-${run}'
 	println('cooperative smoke against ${addr} (topic ${topic})')
 
-	mut c1 := kmsg.new_client(kmsg.Config{
+	mut c1 := kgo.new_client(kgo.Config{
 		seed_brokers:   [addr]
 		fetch_max_wait: 300 * time.millisecond
 	}) or {
@@ -35,7 +35,7 @@ fn main() {
 	defer {
 		c1.close()
 	}
-	mut c2 := kmsg.new_client(kmsg.Config{
+	mut c2 := kgo.new_client(kgo.Config{
 		seed_brokers:   [addr]
 		fetch_max_wait: 300 * time.millisecond
 	}) or {
@@ -73,9 +73,9 @@ fn main() {
 		fail('topic never became ready')
 	}
 
-	mut old := []kmsg.Record{}
+	mut old := []kgo.Record{}
 	for p in 0 .. 4 {
-		old << kmsg.Record{
+		old << kgo.Record{
 			partition: p
 			value:     'old-p${p}'.bytes()
 		}
@@ -85,8 +85,8 @@ fn main() {
 		return
 	}
 
-	coop := kmsg.GroupOpts{
-		balancers:          [kmsg.BalancerKind.cooperative_sticky]
+	coop := kgo.GroupOpts{
+		balancers:          [kgo.BalancerKind.cooperative_sticky]
 		heartbeat_interval: 300 * time.millisecond
 		session_timeout:    10 * time.second
 	}
@@ -94,7 +94,7 @@ fn main() {
 		fail('g1: ${err.msg()}')
 		return
 	}
-	mut first := []kmsg.Record{}
+	mut first := []kgo.Record{}
 	deadline0 := time.now().unix_milli() + 30000
 	for time.now().unix_milli() < deadline0 {
 		first << g1.poll() or {
@@ -117,13 +117,13 @@ fn main() {
 		fail('g2: ${err.msg()}')
 		return
 	}
-	stop := kmsg.new_cancel()
+	stop := kgo.new_cancel()
 	status := chan PollStatus{cap: 64}
 	spawn member_loop(1, mut g1, stop, status)
 	spawn member_loop(2, mut g2, stop, status)
 
 	mut asg := map[int][]int{}
-	mut recs := map[int][]kmsg.Record{}
+	mut recs := map[int][]kgo.Record{}
 	recs[1] = []
 	recs[2] = []
 	deadline := time.now().unix_milli() + 60000
@@ -160,9 +160,9 @@ fn main() {
 
 	// continuity: one new record per partition; g1 must yield ONLY new
 	// records (cursors kept without commits); g2 re-reads its 2 old + 2 new
-	mut fresh := []kmsg.Record{}
+	mut fresh := []kgo.Record{}
 	for p in 0 .. 4 {
-		fresh << kmsg.Record{
+		fresh << kgo.Record{
 			partition: p
 			value:     'new-p${p}'.bytes()
 		}
@@ -206,10 +206,10 @@ fn main() {
 struct PollStatus {
 	who      int
 	assigned []int
-	records  []kmsg.Record
+	records  []kgo.Record
 }
 
-fn member_loop(who int, mut g kmsg.GroupConsumer, stop &kmsg.Cancel, status chan PollStatus) {
+fn member_loop(who int, mut g kgo.GroupConsumer, stop &kgo.Cancel, status chan PollStatus) {
 	topic := g.topics[0]
 	for !stop.is_done() {
 		records := g.poll() or {

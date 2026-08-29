@@ -12,7 +12,7 @@ import time
 
 // ProduceError describes one partition's produce failure.
 pub struct ProduceError {
-	kerr.Error
+	Error
 pub:
 	topic     string
 	partition int
@@ -46,7 +46,7 @@ pub fn (mut c Client) produce(topic string, mut records []Record) ! {
 			// retriable partition errors (leadership moving, replicas
 			// catching up) heal with a metadata refresh
 			if attempt < c.cfg.request_retries {
-				if err is kerr.ProduceError {
+				if err is ProduceError {
 					ke := kerr.error_for_code(err.code) or { kerr.unknown_server_error }
 					if ke.retriable {
 						attempt++
@@ -114,11 +114,11 @@ fn (mut c Client) produce_attempt(topic string, mut records []Record) ! {
 }
 
 fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, by_partition map[int][]int, mut records []Record) ! {
-	mut req := kerr.ProduceRequest{
+	mut req := kmsg.ProduceRequest{
 		acks:           c.cfg.required_acks
 		timeout_millis: int(i64(c.cfg.produce_timeout) / 1000000)
 	}
-	mut req_topic := kerr.ProduceRequestTopic{
+	mut req_topic := kmsg.ProduceRequestTopic{
 		topic: topic
 	}
 	// Produce v13+ addresses topics by uuid (KIP-516): usable once
@@ -130,14 +130,14 @@ fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, 
 	}
 	for partition in partitions {
 		idxs := by_partition[partition]
-		mut batch_records := []kerr.Record{cap: idxs.len}
+		mut batch_records := []krec.Record{cap: idxs.len}
 		for i in idxs {
 			batch_records << records[i]
 		}
-		batch := kerr.build_record_batch(batch_records, kerr.BatchOpts{
+		batch := krec.build_record_batch(batch_records, krec.BatchOpts{
 			codec: c.cfg.compression
 		})!
-		req_topic.partitions << kerr.ProduceRequestTopicPartition{
+		req_topic.partitions << kmsg.ProduceRequestTopicPartition{
 			partition: partition
 			records:   batch
 		}
@@ -145,10 +145,10 @@ fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, 
 	req.topics = [req_topic]
 
 	body := c.request_broker_capped(leader, mut req, cap)!
-	mut resp := kerr.ProduceResponse{
+	mut resp := kmsg.ProduceResponse{
 		version: req.version
 	}
-	mut r := kerr.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -156,14 +156,14 @@ fn (mut c Client) produce_to_leader(leader int, topic string, partitions []int, 
 	// record every successful partition's offsets BEFORE surfacing any
 	// error: an early return would leave accepted records unmarked and a
 	// retry would duplicate them
-	mut first_err := ?kerr.ProduceError(none)
+	mut first_err := ?ProduceError(none)
 	for t in resp.topics {
 		for p in t.partitions {
 			idxs := by_partition[p.partition] or { continue }
 			if p.error_code != 0 {
 				if first_err == none {
 					e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
-					first_err = kerr.ProduceError{
+					first_err = ProduceError{
 						topic:     topic
 						partition: p.partition
 						code:      p.error_code
