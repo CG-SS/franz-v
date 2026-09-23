@@ -8,6 +8,7 @@ module kgo
 import kbin
 import kmsg
 import net
+import sync
 import time
 
 // PromisedResp answers a PromisedReq: the raw response body on success,
