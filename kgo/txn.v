@@ -22,7 +22,7 @@ const ec_concurrent_transactions = i16(51)
 @[heap]
 pub struct TxnProducer {
 pub mut:
-	client           &Client
+	client           &krec.Client
 	transactional_id string
 mut:
 	coordinator    int = -2147483648
@@ -45,7 +45,7 @@ pub fn (mut c Client) new_txn_producer(transactional_id string) !&TxnProducer {
 	if c.known_brokers().len == 0 {
 		c.metadata([])!
 	}
-	mut t := &TxnProducer{
+	mut t := &krec.TxnProducer{
 		client:           c
 		transactional_id: transactional_id
 	}
@@ -56,7 +56,7 @@ pub fn (mut c Client) new_txn_producer(transactional_id string) !&TxnProducer {
 
 fn (mut t TxnProducer) find_txn_coordinator() ! {
 	mut c := t.client
-	mut req := kmsg.FindCoordinatorRequest{
+	mut req := krec.FindCoordinatorRequest{
 		coordinator_key:  t.transactional_id
 		coordinator_type: 1 // transaction
 	}
@@ -64,10 +64,10 @@ fn (mut t TxnProducer) find_txn_coordinator() ! {
 	// broker reports it not yet available
 	for attempt in 0 .. 40 {
 		body := c.request_capped(mut req, 3)!
-		mut resp := kmsg.FindCoordinatorResponse{
+		mut resp := krec.FindCoordinatorResponse{
 			version: req.version
 		}
-		mut r := kbin.Reader{
+		mut r := krec.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
@@ -81,7 +81,7 @@ fn (mut t TxnProducer) find_txn_coordinator() ! {
 				time.sleep(250 * time.millisecond)
 			}
 			else {
-				e := kerr.error_for_code(resp.error_code) or { kerr.unknown_server_error }
+				e := krec.error_for_code(resp.error_code) or { krec.unknown_server_error }
 				return error('find txn coordinator: ${e.msg()}')
 			}
 		}
@@ -91,17 +91,17 @@ fn (mut t TxnProducer) find_txn_coordinator() ! {
 
 fn (mut t TxnProducer) init_producer_id() ! {
 	mut c := t.client
-	mut req := kmsg.InitProducerIDRequest{
+	mut req := krec.InitProducerIDRequest{
 		transactional_id:           t.transactional_id
 		transaction_timeout_millis: 60000
 	}
 	// the coordinator loads its state lazily after (re)start; retry
 	for _ in 0 .. 120 {
 		body := c.request_broker(t.coordinator, mut req)!
-		mut resp := kmsg.InitProducerIDResponse{
+		mut resp := krec.InitProducerIDResponse{
 			version: req.version
 		}
-		mut r := kbin.Reader{
+		mut r := krec.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
@@ -121,7 +121,7 @@ fn (mut t TxnProducer) init_producer_id() ! {
 				t.find_txn_coordinator()!
 			}
 			else {
-				e := kerr.error_for_code(resp.error_code) or { kerr.unknown_server_error }
+				e := krec.error_for_code(resp.error_code) or { krec.unknown_server_error }
 				return error('init producer id: ${e.msg()}')
 			}
 		}
@@ -156,12 +156,12 @@ fn (mut t TxnProducer) add_partitions(topic string, partitions []int) ! {
 		return
 	}
 	mut c := t.client
-	mut req := kmsg.AddPartitionsToTxnRequest{
+	mut req := krec.AddPartitionsToTxnRequest{
 		transactional_id: t.transactional_id
 		producer_id:      t.producer_id
 		producer_epoch:   t.producer_epoch
 		topics:           [
-			kmsg.AddPartitionsToTxnRequestTopic{
+			krec.AddPartitionsToTxnRequestTopic{
 				topic:      topic
 				partitions: missing
 			},
@@ -172,10 +172,10 @@ fn (mut t TxnProducer) add_partitions(topic string, partitions []int) ! {
 	// markers are still being written; retry like other clients do.
 	for _ in 0 .. 100 {
 		body := c.request_broker_capped(t.coordinator, mut req, 3)!
-		mut resp := kmsg.AddPartitionsToTxnResponse{
+		mut resp := krec.AddPartitionsToTxnResponse{
 			version: req.version
 		}
-		mut r := kbin.Reader{
+		mut r := krec.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
@@ -190,7 +190,7 @@ fn (mut t TxnProducer) add_partitions(topic string, partitions []int) ! {
 						retry = true
 					}
 					else {
-						e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
+						e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
 						return error('add partitions to txn ${rt.topic}[${p.partition}]: ${e.msg()}')
 					}
 				}
@@ -247,12 +247,12 @@ pub fn (mut t TxnProducer) produce(topic string, mut records []Record) ! {
 	}
 
 	for leader, parts in by_leader {
-		mut req := kmsg.ProduceRequest{
+		mut req := krec.ProduceRequest{
 			transaction_id: t.transactional_id
 			acks:           -1 // transactions require full acks
 			timeout_millis: int(i64(c.cfg.produce_timeout) / 1000000)
 		}
-		mut req_topic := kmsg.ProduceRequestTopic{
+		mut req_topic := krec.ProduceRequestTopic{
 			topic: topic
 		}
 		mut cap := i16(12)
@@ -274,28 +274,28 @@ pub fn (mut t TxnProducer) produce(topic string, mut records []Record) ! {
 				base_sequence:  t.seqs[seq_key]
 				transactional:  true
 			})!
-			req_topic.partitions << kmsg.ProduceRequestTopicPartition{
+			req_topic.partitions << krec.ProduceRequestTopicPartition{
 				partition: partition
 				records:   batch
 			}
 		}
 		req.topics = [req_topic]
 		body := c.request_broker_capped(leader, mut req, cap)!
-		mut resp := kmsg.ProduceResponse{
+		mut resp := krec.ProduceResponse{
 			version: req.version
 		}
-		mut r := kbin.Reader{
+		mut r := krec.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
-		mut first_err := ?ProduceError(none)
+		mut first_err := ?krec.ProduceError(none)
 		for rt in resp.topics {
 			for p in rt.partitions {
 				idxs := by_partition[p.partition] or { continue }
 				if p.error_code != 0 {
 					if first_err == none {
-						e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
-						first_err = ProduceError{
+						e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
+						first_err = krec.ProduceError{
 							topic:     topic
 							partition: p.partition
 							code:      p.error_code
@@ -328,7 +328,7 @@ pub fn (mut t TxnProducer) send_offsets(group string, offsets map[string]i64) ! 
 		return
 	}
 	mut c := t.client
-	mut areq := kmsg.AddOffsetsToTxnRequest{
+	mut areq := krec.AddOffsetsToTxnRequest{
 		transactional_id: t.transactional_id
 		producer_id:      t.producer_id
 		producer_epoch:   t.producer_epoch
@@ -336,10 +336,10 @@ pub fn (mut t TxnProducer) send_offsets(group string, offsets map[string]i64) ! 
 	}
 	for _ in 0 .. 100 {
 		abody := c.request_broker(t.coordinator, mut areq)!
-		mut aresp := kmsg.AddOffsetsToTxnResponse{
+		mut aresp := krec.AddOffsetsToTxnResponse{
 			version: areq.version
 		}
-		mut ar := kbin.Reader{
+		mut ar := krec.Reader{
 			src: abody
 		}
 		aresp.read_from(mut ar)!
@@ -351,20 +351,20 @@ pub fn (mut t TxnProducer) send_offsets(group string, offsets map[string]i64) ! 
 			time.sleep(100 * time.millisecond)
 			continue
 		}
-		e := kerr.error_for_code(aresp.error_code) or { kerr.unknown_server_error }
+		e := krec.error_for_code(aresp.error_code) or { krec.unknown_server_error }
 		return error('add offsets to txn: ${e.msg()}')
 	}
 
 	// the group coordinator receives the staged offsets
-	mut greq := kmsg.FindCoordinatorRequest{
+	mut greq := krec.FindCoordinatorRequest{
 		coordinator_key:  group
 		coordinator_type: 0
 	}
 	gbody := c.request_capped(mut greq, 3)!
-	mut gresp := kmsg.FindCoordinatorResponse{
+	mut gresp := krec.FindCoordinatorResponse{
 		version: greq.version
 	}
-	mut gr := kbin.Reader{
+	mut gr := krec.Reader{
 		src: gbody
 	}
 	gresp.read_from(mut gr)!
@@ -372,15 +372,15 @@ pub fn (mut t TxnProducer) send_offsets(group string, offsets map[string]i64) ! 
 		return error('find group coordinator: error ${gresp.error_code}')
 	}
 
-	mut per_topic := map[string][]kmsg.TxnOffsetCommitRequestTopicPartition{}
+	mut per_topic := map[string][]krec.TxnOffsetCommitRequestTopicPartition{}
 	for key, off in offsets {
 		idx := key.last_index('/') or { continue }
-		per_topic[key[..idx]] << kmsg.TxnOffsetCommitRequestTopicPartition{
+		per_topic[key[..idx]] << krec.TxnOffsetCommitRequestTopicPartition{
 			partition: key[idx + 1..].int()
 			offset:    off
 		}
 	}
-	mut treq := kmsg.TxnOffsetCommitRequest{
+	mut treq := krec.TxnOffsetCommitRequest{
 		transactional_id: t.transactional_id
 		group:            group
 		producer_id:      t.producer_id
@@ -389,24 +389,24 @@ pub fn (mut t TxnProducer) send_offsets(group string, offsets map[string]i64) ! 
 	mut topics := per_topic.keys()
 	topics.sort()
 	for topic in topics {
-		treq.topics << kmsg.TxnOffsetCommitRequestTopic{
+		treq.topics << krec.TxnOffsetCommitRequestTopic{
 			topic:      topic
 			partitions: per_topic[topic]
 		}
 	}
 	// v3+ adds group generation/member fencing (KIP-447); classic shape
 	tbody := c.request_broker_capped(gresp.node_id, mut treq, 2)!
-	mut tresp := kmsg.TxnOffsetCommitResponse{
+	mut tresp := krec.TxnOffsetCommitResponse{
 		version: treq.version
 	}
-	mut tr := kbin.Reader{
+	mut tr := krec.Reader{
 		src: tbody
 	}
 	tresp.read_from(mut tr)!
 	for rt in tresp.topics {
 		for p in rt.partitions {
 			if p.error_code != 0 {
-				e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
+				e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
 				return error('txn offset commit ${rt.topic}[${p.partition}]: ${e.msg()}')
 			}
 		}
@@ -418,7 +418,7 @@ fn (mut t TxnProducer) end(commit bool) ! {
 		return error('no open transaction')
 	}
 	mut c := t.client
-	mut req := kmsg.EndTxnRequest{
+	mut req := krec.EndTxnRequest{
 		transactional_id: t.transactional_id
 		producer_id:      t.producer_id
 		producer_epoch:   t.producer_epoch
@@ -427,10 +427,10 @@ fn (mut t TxnProducer) end(commit bool) ! {
 	// v5+ (KIP-890) changes epoch semantics; stay on the classic shape
 	for _ in 0 .. 100 {
 		body := c.request_broker_capped(t.coordinator, mut req, 4)!
-		mut resp := kmsg.EndTxnResponse{
+		mut resp := krec.EndTxnResponse{
 			version: req.version
 		}
-		mut r := kbin.Reader{
+		mut r := krec.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
@@ -444,7 +444,7 @@ fn (mut t TxnProducer) end(commit bool) ! {
 				time.sleep(100 * time.millisecond)
 			}
 			else {
-				e := kerr.error_for_code(resp.error_code) or { kerr.unknown_server_error }
+				e := krec.error_for_code(resp.error_code) or { krec.unknown_server_error }
 				return error('end txn: ${e.msg()}')
 			}
 		}

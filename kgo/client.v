@@ -20,16 +20,16 @@ import time
 @[heap]
 pub struct Client {
 pub mut:
-	cfg    Config
-	cancel &Cancel
+	cfg    kversion.Config
+	cancel &kversion.Cancel
 mut:
 	mu          &sync.Mutex = sync.new_mutex()
-	seeds       []&Broker
-	brokers     map[int]&Broker     // node id -> discovered broker
+	seeds       []&kversion.Broker
+	brokers     map[int]&kversion.Broker     // node id -> discovered broker
 	versions    map[string]kversion.Versions // broker addr -> negotiated versions
 	topic_ids   map[string][16]u8            // topic name -> uuid (KIP-516)
 	names_by_id map[string]string            // uuid hex -> topic name
-	meta        ?kmsg.MetadataResponse
+	meta        ?kversion.MetadataResponse
 	rr          u32 // round-robin cursor for any_broker
 }
 
@@ -38,13 +38,13 @@ mut:
 pub fn new_client(cfg Config) !&Client {
 	cfg.validate()!
 	mut cancel := new_cancel()
-	mut c := &Client{
+	mut c := &kversion.Client{
 		cfg:    cfg
 		cancel: cancel
 	}
 	for i, seed in cfg.seed_brokers {
 		host, port := parse_broker_addr(seed)!
-		mut b := new_broker(BrokerMetadata{
+		mut b := new_broker(kversion.BrokerMetadata{
 			node_id: -(i + 1) // seeds get negative ids, like franz-go
 			host:    host
 			port:    port
@@ -72,7 +72,7 @@ fn (mut c Client) any_broker() ?&Broker {
 	defer {
 		c.mu.unlock()
 	}
-	mut pool := []&Broker{}
+	mut pool := []&kversion.Broker{}
 	for _, b in c.brokers {
 		pool << b
 	}
@@ -113,38 +113,38 @@ fn (mut c Client) broker_by_node(node_id int) ?&Broker {
 // v3 the broker answered with a v0 body (ancient broker, or
 // UNSUPPORTED_VERSION per KIP-511), so decode as v0 and, on error 35,
 // re-request at v0.
-fn (mut c Client) negotiate_api_versions(mut b Broker) !kmsg.ApiVersionsResponse {
-	mut req := kmsg.ApiVersionsRequest{
+fn (mut c Client) negotiate_api_versions(mut b Broker) !ApiVersionsResponse {
+	mut req := kversion.ApiVersionsRequest{
 		version:                 3
 		client_software_name:    c.cfg.software_name
 		client_software_version: c.cfg.software_version
 	}
 	body := b.request(req)!
-	mut resp := kmsg.ApiVersionsResponse{
+	mut resp := kversion.ApiVersionsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kversion.Reader{
 		src: body
 	}
 	resp.read_from(mut r) or {
 		// v0-encoded body from an older broker
-		resp = kmsg.ApiVersionsResponse{
+		resp = kversion.ApiVersionsResponse{
 			version: 0
 		}
-		mut r0 := kbin.Reader{
+		mut r0 := kversion.Reader{
 			src: body
 		}
 		resp.read_from(mut r0)!
 	}
 	if resp.error_code == 35 { // UNSUPPORTED_VERSION: re-request at v0
-		mut req0 := kmsg.ApiVersionsRequest{
+		mut req0 := kversion.ApiVersionsRequest{
 			version: 0
 		}
 		body0 := b.request(req0)!
-		resp = kmsg.ApiVersionsResponse{
+		resp = kversion.ApiVersionsResponse{
 			version: 0
 		}
-		mut r0 := kbin.Reader{
+		mut r0 := kversion.Reader{
 			src: body0
 		}
 		resp.read_from(mut r0)!
@@ -154,7 +154,7 @@ fn (mut c Client) negotiate_api_versions(mut b Broker) !kmsg.ApiVersionsResponse
 
 // versions_for returns (negotiating on first use) the broker's supported
 // versions.
-fn (mut c Client) versions_for(mut b Broker) !kversion.Versions {
+fn (mut c Client) versions_for(mut b Broker) !Versions {
 	addr := b.meta.addr()
 	c.mu.lock()
 	if vs := c.versions[addr] {
@@ -193,10 +193,10 @@ pub fn (mut c Client) negotiated_version(addr string, key i16) ?i16 {
 // choose_version resolves the version to use for req against one broker:
 // the minimum of the client's supported max, the configured cap, and the
 // broker's advertised max.
-fn (c &Client) choose_version(req kmsg.Request, broker_vs kversion.Versions) !i16 {
+fn (c &Client) choose_version(req Request, broker_vs Versions) !i16 {
 	key := req.key()
 	bmax := broker_vs.lookup_max_key_version(key) or {
-		return UnsupportedVersionError{
+		return kversion.UnsupportedVersionError{
 			key: key
 		}
 	}
@@ -210,7 +210,7 @@ fn (c &Client) choose_version(req kmsg.Request, broker_vs kversion.Versions) !i1
 		v = bmax
 	}
 	if v < 0 {
-		return UnsupportedVersionError{
+		return kversion.UnsupportedVersionError{
 			key: key
 		}
 	}
@@ -225,15 +225,15 @@ fn (c &Client) choose_version(req kmsg.Request, broker_vs kversion.Versions) !i1
 // needed and setting req.version to the chosen version.
 // cap, when >= 0, bounds the negotiated version (used e.g. to stay on
 // name-addressed Produce until topic-id resolution is implemented).
-fn (mut c Client) request_on(mut b Broker, mut req kmsg.Request, cap i16) PromisedResp {
+fn (mut c Client) request_on(mut b Broker, mut req Request, cap i16) PromisedResp {
 	vs := c.versions_for(mut b) or {
-		return PromisedResp{
+		return kversion.PromisedResp{
 			err_msg:   err.msg()
 			retriable: is_retriable_err(err) || err.msg().contains('connection')
 		}
 	}
 	mut ver := c.choose_version(req, vs) or {
-		return PromisedResp{
+		return kversion.PromisedResp{
 			err_msg: err.msg()
 		}
 	}
@@ -248,10 +248,10 @@ fn (mut c Client) request_on(mut b Broker, mut req kmsg.Request, cap i16) Promis
 // (possibly different) brokers with backoff, up to cfg.request_retries
 // retries. On success, req.version holds the negotiated version — decode
 // the returned body with the matching response type at that version.
-pub fn (mut c Client) request(mut req kmsg.Request) ![]u8 {
+pub fn (mut c Client) request(mut req Request) ![]u8 {
 	mut attempt := 0
 	for {
-		mut b := c.any_broker() or { return NoBrokersError{} }
+		mut b := c.any_broker() or { return kversion.NoBrokersError{} }
 		res := c.request_on(mut b, mut req, -1)
 		if body := res.body {
 			return body
@@ -263,21 +263,21 @@ pub fn (mut c Client) request(mut req kmsg.Request) ![]u8 {
 		c.cfg.log(.debug, 'retrying request key ${req.key()} (attempt ${attempt}): ${res.err_msg}')
 		time.sleep(c.cfg.backoff_for(attempt - 1))
 		if c.cancel.is_done() {
-			return ClientClosedError{}
+			return kversion.ClientClosedError{}
 		}
 	}
-	return NoBrokersError{}
+	return kversion.NoBrokersError{}
 }
 
 // request_broker issues req against one specific broker node, retrying
 // retriable failures on that same broker.
-pub fn (mut c Client) request_broker(node_id int, mut req kmsg.Request) ![]u8 {
+pub fn (mut c Client) request_broker(node_id int, mut req Request) ![]u8 {
 	return c.request_broker_capped(node_id, mut req, -1)
 }
 
 // request_broker_capped is request_broker with an upper bound on the
 // negotiated version (cap < 0 means uncapped).
-pub fn (mut c Client) request_broker_capped(node_id int, mut req kmsg.Request, cap i16) ![]u8 {
+pub fn (mut c Client) request_broker_capped(node_id int, mut req Request, cap i16) ![]u8 {
 	mut attempt := 0
 	for {
 		mut b := c.broker_by_node(node_id) or { return error('unknown broker node ${node_id}') }
@@ -291,10 +291,10 @@ pub fn (mut c Client) request_broker_capped(node_id int, mut req kmsg.Request, c
 		attempt++
 		time.sleep(c.cfg.backoff_for(attempt - 1))
 		if c.cancel.is_done() {
-			return ClientClosedError{}
+			return kversion.ClientClosedError{}
 		}
 	}
-	return NoBrokersError{}
+	return kversion.NoBrokersError{}
 }
 
 // ---------------------------------------------------------------------------
@@ -304,18 +304,18 @@ pub fn (mut c Client) request_broker_capped(node_id int, mut req kmsg.Request, c
 // metadata requests cluster metadata for the given topics (empty = all
 // topics), updates the cached metadata, and starts workers for any newly
 // discovered brokers.
-pub fn (mut c Client) metadata(topics []string) !kmsg.MetadataResponse {
-	mut req := kmsg.MetadataRequest{}
+pub fn (mut c Client) metadata(topics []string) !MetadataResponse {
+	mut req := kversion.MetadataRequest{}
 	if topics.len > 0 {
-		req.topics = topics.map(kmsg.MetadataRequestTopic{
+		req.topics = topics.map(kversion.MetadataRequestTopic{
 			topic: it
 		})
 	}
 	body := c.request(mut req)!
-	mut resp := kmsg.MetadataResponse{
+	mut resp := kversion.MetadataResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kversion.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -324,7 +324,7 @@ pub fn (mut c Client) metadata(topics []string) !kmsg.MetadataResponse {
 }
 
 // apply_metadata stores the cache and registers newly discovered brokers.
-fn (mut c Client) apply_metadata(resp kmsg.MetadataResponse) {
+fn (mut c Client) apply_metadata(resp MetadataResponse) {
 	c.mu.lock()
 	c.meta = resp
 	zero := [16]u8{}
@@ -335,10 +335,10 @@ fn (mut c Client) apply_metadata(resp kmsg.MetadataResponse) {
 			c.names_by_id[t.topic_id[..].hex()] = tname
 		}
 	}
-	mut to_start := []&Broker{}
+	mut to_start := []&kversion.Broker{}
 	for br in resp.brokers {
 		if br.node_id !in c.brokers {
-			mut b := new_broker(BrokerMetadata{
+			mut b := new_broker(kversion.BrokerMetadata{
 				node_id: br.node_id
 				host:    br.host
 				port:    br.port
@@ -355,7 +355,7 @@ fn (mut c Client) apply_metadata(resp kmsg.MetadataResponse) {
 }
 
 // cached_metadata returns the last metadata response, if any.
-pub fn (mut c Client) cached_metadata() ?kmsg.MetadataResponse {
+pub fn (mut c Client) cached_metadata() ?MetadataResponse {
 	c.mu.lock()
 	defer {
 		c.mu.unlock()
