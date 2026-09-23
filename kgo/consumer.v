@@ -7,6 +7,7 @@ import kbin
 import kerr
 import kmsg
 import krec
+import time
 
 // IsolationLevel selects transactional visibility for fetches.
 pub enum IsolationLevel {
@@ -24,7 +25,7 @@ pub enum StartOffset {
 pub struct ConsumerOpts {
 pub mut:
 	// start is where cursors begin for each partition.
-	start krec.StartOffset = .earliest
+	start StartOffset = .earliest
 }
 
 // Consumer consumes explicit topics with per-partition cursors. Obtain one
@@ -32,7 +33,7 @@ pub mut:
 @[heap]
 pub struct Consumer {
 pub mut:
-	client &krec.Client
+	client &Client
 mut:
 	cursors map[string]i64 // 'topic/partition' -> next offset to fetch
 }
@@ -45,37 +46,83 @@ fn cursor_key(topic string, partition int) string {
 // with cursors resolved via ListOffsets according to opts.start.
 pub fn (mut c Client) new_consumer(topics []string, opts ConsumerOpts) !&Consumer {
 	c.metadata(topics)!
-	mut co := &krec.Consumer{
+	mut co := &Consumer{
 		client: c
 	}
 	ts := if opts.start == .earliest { i64(-2) } else { i64(-1) }
 	for topic in topics {
 		nparts := c.partition_count(topic) or { return error('topic ${topic}: no partitions') }
-		// group partitions per leader for ListOffsets
-		mut by_leader := map[int][]int{}
-		for p in 0 .. nparts {
-			leader := c.leader_for(topic, p)!
-			by_leader[leader] << p
-		}
-		for leader, parts in by_leader {
-			offsets := c.list_offsets(leader, topic, parts, ts)!
-			for p, off in offsets {
-				co.cursors[cursor_key(topic, p)] = off
-			}
+		offsets := c.start_offsets(topic, []int{len: nparts, init: index}, ts)!
+		for p, off in offsets {
+			co.cursors[cursor_key(topic, p)] = off
 		}
 	}
 	return co
 }
 
+// ListOffsetsError is a partition-level ListOffsets failure.
+pub struct ListOffsetsError {
+	Error
+pub:
+	topic     string
+	partition int
+	code      i16
+	detail    string
+}
+
+// msg implements IError.
+pub fn (e ListOffsetsError) msg() string {
+	return 'list offsets ${e.topic}[${e.partition}]: ${e.detail}'
+}
+
+// start_offsets resolves partitions of one topic at ts (-2 earliest, -1
+// latest), asking each partition's leader. A leader that is not ready,
+// as right after the topic was created or while leadership moves,
+// answers with a retriable error: refresh metadata and retry, as
+// produce does.
+fn (mut c Client) start_offsets(topic string, partitions []int, ts i64) !map[int]i64 {
+	mut attempt := 0
+	for {
+		offsets := c.start_offsets_attempt(topic, partitions, ts) or {
+			retriable := err is ListOffsetsError && kerr.is_retriable(err.code)
+			if !retriable || attempt >= c.cfg.request_retries {
+				return err
+			}
+			attempt++
+			time.sleep(c.cfg.backoff_for(attempt - 1))
+			c.metadata([topic]) or {}
+			continue
+		}
+		return offsets
+	}
+}
+
+fn (mut c Client) start_offsets_attempt(topic string, partitions []int, ts i64) !map[int]i64 {
+	// group partitions per leader for ListOffsets
+	mut by_leader := map[int][]int{}
+	for p in partitions {
+		leader := c.leader_for(topic, p)!
+		by_leader[leader] << p
+	}
+	mut out := map[int]i64{}
+	for leader, ps in by_leader {
+		offsets := c.list_offsets(leader, topic, ps, ts)!
+		for p, off in offsets {
+			out[p] = off
+		}
+	}
+	return out
+}
+
 // list_offsets resolves offsets for partitions of one topic on one leader;
 // ts is -2 for earliest, -1 for latest.
 pub fn (mut c Client) list_offsets(leader int, topic string, partitions []int, ts i64) !map[int]i64 {
-	mut req := krec.ListOffsetsRequest{
+	mut req := kmsg.ListOffsetsRequest{
 		replica_id: -1
 		topics:     [
-			krec.ListOffsetsRequestTopic{
+			kmsg.ListOffsetsRequestTopic{
 				topic:      topic
-				partitions: partitions.map(krec.ListOffsetsRequestTopicPartition{
+				partitions: partitions.map(kmsg.ListOffsetsRequestTopicPartition{
 					partition: it
 					timestamp: ts
 				})
@@ -83,10 +130,10 @@ pub fn (mut c Client) list_offsets(leader int, topic string, partitions []int, t
 		]
 	}
 	body := c.request_broker(leader, mut req)!
-	mut resp := krec.ListOffsetsResponse{
+	mut resp := kmsg.ListOffsetsResponse{
 		version: req.version
 	}
-	mut r := krec.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -94,8 +141,13 @@ pub fn (mut c Client) list_offsets(leader int, topic string, partitions []int, t
 	for t in resp.topics {
 		for p in t.partitions {
 			if p.error_code != 0 {
-				e := krec.error_for_code(p.error_code) or { krec.unknown_server_error }
-				return error('list offsets ${topic}[${p.partition}]: ${e.msg()}')
+				e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
+				return ListOffsetsError{
+					topic:     topic
+					partition: p.partition
+					code:      p.error_code
+					detail:    e.msg()
+				}
 			}
 			// v0 returns old_style_offsets; v1+ a single offset
 			if req.version == 0 && p.old_style_offsets.len > 0 {
@@ -132,14 +184,14 @@ mut:
 pub fn (mut co Consumer) poll() ![]Record {
 	mut c := co.client
 	// group cursors: leader -> topic -> partitions
-	mut leader_topics := map[int]map[string]krec.FetchTarget{}
+	mut leader_topics := map[int]map[string]FetchTarget{}
 	for key, _ in co.cursors {
 		idx := key.last_index('/') or { continue }
 		topic := key[..idx]
 		partition := key[idx + 1..].int()
 		leader := c.leader_for(topic, partition)!
 		if topic !in leader_topics[leader] {
-			leader_topics[leader][topic] = krec.FetchTarget{
+			leader_topics[leader][topic] = FetchTarget{
 				topic: topic
 			}
 		}
@@ -160,7 +212,7 @@ pub fn (mut co Consumer) poll() ![]Record {
 
 fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut out []Record) ! {
 	mut c := co.client
-	mut req := krec.FetchRequest{
+	mut req := kmsg.FetchRequest{
 		replica_id:      -1
 		max_wait_millis: int(i64(c.cfg.fetch_max_wait) / 1000000)
 		min_bytes:       c.cfg.fetch_min_bytes
@@ -172,7 +224,7 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 	// requested topic's id is known, else stay on v12 names
 	mut cap := i16(-1)
 	for _, target in targets {
-		mut ft := krec.FetchRequestTopic{
+		mut ft := kmsg.FetchRequestTopic{
 			topic: target.topic
 		}
 		if id := c.topic_id(target.topic) {
@@ -181,7 +233,7 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 			cap = 12
 		}
 		for p in target.partitions {
-			ft.partitions << krec.FetchRequestTopicPartition{
+			ft.partitions << kmsg.FetchRequestTopicPartition{
 				partition:            p
 				fetch_offset:         co.cursors[cursor_key(target.topic, p)]
 				current_leader_epoch: -1
@@ -193,10 +245,10 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 	}
 
 	body := c.request_broker_capped(leader, mut req, cap)!
-	mut resp := krec.FetchResponse{
+	mut resp := kmsg.FetchResponse{
 		version: req.version
 	}
-	mut r := krec.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -222,7 +274,7 @@ fn (mut co Consumer) fetch_from(leader int, targets map[string]FetchTarget, mut 
 			// aborted transactions of this response, activated once the
 			// scan reaches their first offset (read_committed only)
 			mut aborted := (p.aborted_transactions or {
-				[]krec.FetchResponseTopicPartitionAbortedTransaction{}
+				[]kmsg.FetchResponseTopicPartitionAbortedTransaction{}
 			}).clone()
 
 			aborted.sort(a.first_offset < b.first_offset)
@@ -284,8 +336,7 @@ fn (mut co Consumer) handle_partition_error(topic string, partition int, code i1
 	match code {
 		1 { // OFFSET_OUT_OF_RANGE: reset per policy
 			ts := if c.cfg.offset_reset == .earliest { i64(-2) } else { i64(-1) }
-			leader := c.leader_for(topic, partition)!
-			offsets := c.list_offsets(leader, topic, [partition], ts)!
+			offsets := c.start_offsets(topic, [partition], ts)!
 			co.cursors[cursor_key(topic, partition)] = offsets[partition]
 			c.cfg.log(.info,
 				'reset ${topic}[${partition}] to ${offsets[partition]} (offset out of range)')
@@ -294,7 +345,7 @@ fn (mut co Consumer) handle_partition_error(topic string, partition int, code i1
 			c.metadata([topic])!
 		}
 		else {
-			e := krec.error_for_code(code) or { krec.unknown_server_error }
+			e := kerr.error_for_code(code) or { kerr.unknown_server_error }
 			return error('fetch ${topic}[${partition}]: ${e.msg()}')
 		}
 	}

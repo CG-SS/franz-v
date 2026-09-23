@@ -66,6 +66,25 @@ pub fn (e ResponseTooLargeError) msg() string {
 	return 'response frame of ${e.size} bytes exceeds the maximum allowed'
 }
 
+// SaslError is a failed SASL exchange with a broker: it rejected the
+// credentials or the mechanism, or the mechanism itself failed. It is not
+// retriable; transport failures during the exchange are BrokerConnErrors.
+pub struct SaslError {
+	Error
+pub:
+	host      string
+	mechanism string
+	detail    string
+	// fallback is set when the broker rejected the mechanism but enables
+	// another configured one, which a new connection can use.
+	fallback bool
+}
+
+// msg implements IError.
+pub fn (e SaslError) msg() string {
+	return 'SASL ${e.mechanism} with ${e.host} failed: ${e.detail}'
+}
+
 // is_retriable_err reports whether an error is worth retrying: transient
 // connection problems, timeouts, and retriable Kafka error codes.
 pub fn is_retriable_err(err IError) bool {

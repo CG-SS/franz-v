@@ -15,6 +15,17 @@ const batch_header_before_crc = 17
 // through num_records: 4+1+4+2+4+8+8+8+2+4+4.
 const batch_len_after_length_field = 49
 
+// next_sequence returns the producer sequence number that follows seq after
+// n records. Sequences are int32 values that wrap from max_i32 to 0, exactly
+// like Kafka's DefaultRecordBatch.incrementSequence: an idempotent producer
+// sends the result as the next batch's base sequence, and brokers expect it.
+pub fn next_sequence(seq int, n int) int {
+	if seq > max_i32 - n {
+		return n - (max_i32 - seq) - 1
+	}
+	return seq + n
+}
+
 // BatchOpts configures build_record_batch; the defaults produce a
 // non-idempotent, non-transactional batch.
 pub struct BatchOpts {

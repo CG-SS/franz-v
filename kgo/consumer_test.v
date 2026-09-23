@@ -252,3 +252,53 @@ fn test_consume_compressed() {
 	v := recs[2].value or { []u8{} }
 	assert v.bytestr() == 'g-v2'
 }
+
+fn test_start_offsets_wait_for_a_leader_that_is_not_ready() {
+	// Right after a topic is created, its leader can answer ListOffsets
+	// with NOT_LEADER_OR_FOLLOWER for a moment: the consumer retries
+	// after a metadata refresh instead of failing to start.
+	mut cl := kfake.start(1, kfake.ClusterCfg{
+		not_leader_list_offsets: 2
+	})
+	mut c := new_client(Config{
+		seed_brokers:      [cl.seed_addr()]
+		fetch_max_wait:    100 * time.millisecond
+		retry_backoff_min: 10 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c.close()
+	}
+	produce_n(mut c, 'events', 3, 's')
+	mut co := c.new_consumer(['events'], ConsumerOpts{}) or {
+		assert false, 'consumer start: ${err}'
+		return
+	}
+	recs := co.poll() or {
+		assert false, 'poll: ${err}'
+		return
+	}
+	assert recs.len == 3
+
+	// a leader that never becomes ready still fails, once retries run out
+	mut stuck := kfake.start(1, kfake.ClusterCfg{
+		not_leader_list_offsets: 1000
+	})
+	mut c2 := new_client(Config{
+		seed_brokers:      [stuck.seed_addr()]
+		retry_backoff_min: 10 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c2.close()
+	}
+	c2.new_consumer(['events'], ConsumerOpts{}) or {
+		assert err.msg().starts_with('list offsets events[0]: NOT_LEADER'), err.msg()
+		return
+	}
+	assert false, 'consumer started without start offsets'
+}

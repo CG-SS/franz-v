@@ -6,6 +6,7 @@
 // header v0 so that clients can bootstrap version negotiation.
 module kgo
 
+import io
 import kbin
 import kmsg
 import net
@@ -49,7 +50,13 @@ fn write_all(mut conn net.TcpConn, buf []u8) ! {
 fn read_full(mut conn net.TcpConn, mut buf []u8) ! {
 	mut off := 0
 	for off < buf.len {
-		n := conn.read(mut buf[off..]) or { return error('read: ${err.msg()}') }
+		n := conn.read(mut buf[off..]) or {
+			// the peer closing the connection is an io.Eof, with no message
+			if err is io.Eof {
+				return error('read: connection closed')
+			}
+			return error('read: ${err.msg()}')
+		}
 		if n <= 0 {
 			return error('read: connection closed')
 		}

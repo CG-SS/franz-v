@@ -25,7 +25,7 @@ pub:
 pub struct PromisedReq {
 pub:
 	req  kmsg.Request
-	resp chan kmsg.PromisedResp
+	resp chan PromisedResp
 }
 
 // Broker is a handle to one broker's worker loop. Obtain it from
@@ -34,20 +34,24 @@ pub:
 @[heap]
 pub struct Broker {
 pub:
-	meta kmsg.BrokerMetadata
+	meta BrokerMetadata
 pub mut:
-	cfg    kmsg.Config
-	cancel &kmsg.Cancel
-	reqs   chan kmsg.PromisedReq
+	cfg    Config
+	cancel &Cancel
+	reqs   chan PromisedReq
+mut:
+	// sasl_enabled lists the mechanisms the broker reported enabled when
+	// it rejected one; later connections pick a configured one of them.
+	sasl_enabled []string
 }
 
 // new_broker returns a Broker handle for the given address.
 pub fn new_broker(meta BrokerMetadata, cfg Config, cancel &Cancel) &Broker {
-	return &kmsg.Broker{
+	return &Broker{
 		meta:   meta
 		cfg:    cfg
 		cancel: cancel
-		reqs:   chan kmsg.PromisedReq{cap: 128}
+		reqs:   chan PromisedReq{cap: 128}
 	}
 }
 
@@ -60,17 +64,18 @@ pub fn (mut b Broker) start() {
 // PromisedResp (including the retriable classification). Selecting on
 // cancel at both steps ensures callers never hang once the broker (or
 // client) is shut down.
-pub fn (b &Broker) promise(req Request) PromisedResp {
-	resp_ch := chan kmsg.PromisedResp{cap: 1}
-	preq := kmsg.PromisedReq{
+pub fn (b &Broker) promise(req kmsg.Request) PromisedResp {
+	resp_ch := chan PromisedResp{cap: 1}
+	preq := PromisedReq{
 		req:  req
 		resp: resp_ch
 	}
-	closed := kmsg.PromisedResp{
-		err_msg: kmsg.ClientClosedError{}.msg()
+	closed := PromisedResp{
+		err_msg: ClientClosedError{}.msg()
 	}
 	select {
-		b.reqs <- preq {}
+		b.reqs <- preq {
+		}
 		_ := <-b.cancel.done {
 			return closed
 		}
@@ -88,7 +93,7 @@ pub fn (b &Broker) promise(req Request) PromisedResp {
 
 // request is promise() reduced to a Result: the raw response body on
 // success. Decode it with the matching kmsg response type at req.version.
-pub fn (b &Broker) request(req Request) ![]u8 {
+pub fn (b &Broker) request(req kmsg.Request) ![]u8 {
 	resp := b.promise(req)
 	if body := resp.body {
 		return body
@@ -108,9 +113,9 @@ enum ConnClass {
 
 fn class_for_key(key i16) ConnClass {
 	return match key {
-		1 { kmsg.ConnClass.fetch }
-		8, 9, 10, 11, 12, 13, 14 { kmsg.ConnClass.coord }
-		else { kmsg.ConnClass.normal }
+		1 { ConnClass.fetch }
+		8, 9, 10, 11, 12, 13, 14 { ConnClass.coord }
+		else { ConnClass.normal }
 	}
 }
 
@@ -119,7 +124,7 @@ struct Inflight {
 	corr     int
 	flexible bool
 	key      i16
-	resp     chan kmsg.PromisedResp
+	resp     chan PromisedResp
 }
 
 // ConnState is one pipelined connection: the writer appends to inflight
@@ -130,24 +135,32 @@ struct Inflight {
 struct ConnState {
 mut:
 	conn      &net.TcpConn
-	inflight  chan kmsg.Inflight
+	inflight  chan Inflight
 	mu        &sync.Mutex = sync.new_mutex()
 	dead      bool // set by reader on transport/correlation failure
-	closed    bool // set by writer once socket + channel are closed
+	closed    bool // set once the socket is closed: by the writer, or by a retired connection's reader
 	next_corr int
+	// reauth_at (unix ms) is when the SASL session is close to expiry;
+	// the writer then retires the connection. 0 = never.
+	reauth_at i64
+	retired   bool // no new requests; the reader closes it once drained
 }
 
 fn (mut b Broker) run() {
-	mut conns := map[int]&kmsg.ConnState{}
+	mut conns := map[int]&ConnState{}
+	mut retired := []&ConnState{}
 	defer {
 		for _, mut st in conns {
+			b.close_state(mut st)
+		}
+		for mut st in retired {
 			b.close_state(mut st)
 		}
 	}
 	for {
 		select {
 			preq := <-b.reqs {
-				b.dispatch(preq, mut conns)
+				b.dispatch(preq, mut conns, mut retired)
 			}
 			_ := <-b.cancel.done {
 				// drain whatever is already queued (non-blocking), then
@@ -155,8 +168,8 @@ fn (mut b Broker) run() {
 				for {
 					select {
 						preq := <-b.reqs {
-							preq.resp <- kmsg.PromisedResp{
-								err_msg: kmsg.ClientClosedError{}.msg()
+							preq.resp <- PromisedResp{
+								err_msg: ClientClosedError{}.msg()
 							}
 						}
 						else {
@@ -170,12 +183,14 @@ fn (mut b Broker) run() {
 }
 
 // dispatch writes one request on its class connection and registers it
-// in-flight; the connection's reader resolves the promise later.
-fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
+// in-flight; the connection's reader resolves the promise later. Retired
+// connections that are still answering requests are kept in retired.
+fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState, mut retired []&ConnState) {
 	class := class_for_key(preq.req.key())
 	idx := int(class)
 
-	// reap a connection its reader declared dead
+	// reap a connection its reader declared dead, and retire one whose
+	// SASL session is about to expire (a new one re-authenticates)
 	if idx in conns {
 		mut st0 := conns[idx] or { return }
 		st0.mu.lock()
@@ -184,21 +199,37 @@ fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
 		if dead {
 			b.close_state(mut st0)
 			conns.delete(idx)
+		} else if st0.reauth_at > 0 && time.now().unix_milli() >= st0.reauth_at {
+			b.retire_state(mut st0)
+			conns.delete(idx)
+			// forget the retired connections their readers have closed
+			for i := retired.len - 1; i >= 0; i-- {
+				mut old := retired[i]
+				old.mu.lock()
+				closed := old.closed
+				old.mu.unlock()
+				if closed {
+					retired.delete(i)
+				}
+			}
+			retired << st0
 		}
 	}
 	mut st := conns[idx] or {
-		conn := dial_broker(b.meta, mut b.cfg) or {
-			b.cfg.log(.warn, 'dial ${b.meta.addr()} failed: ${err.msg()}')
-			preq.resp <- kmsg.PromisedResp{
+		conn, session := b.dial_authenticated() or {
+			b.cfg.log(.warn, 'connecting to ${b.meta.addr()} failed: ${err.msg()}')
+			preq.resp <- PromisedResp{
 				err_msg:   err.msg()
-				retriable: true
+				retriable: err !is SaslError
 			}
 			return
 		}
 		b.cfg.log(.debug, 'connected to ${b.meta.addr()} (${class})')
-		mut nst := &kmsg.ConnState{
-			conn:     conn
-			inflight: chan kmsg.Inflight{cap: b.cfg.max_inflight}
+		mut nst := &ConnState{
+			conn:      conn
+			inflight:  chan Inflight{cap: b.cfg.max_inflight}
+			next_corr: session.next_corr
+			reauth_at: session.reauth_at
 		}
 		spawn b.reader(mut nst)
 		conns[idx] = nst
@@ -215,8 +246,8 @@ fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
 		}
 		b.close_state(mut st)
 		conns.delete(idx)
-		preq.resp <- kmsg.PromisedResp{
-			err_msg:   kmsg.BrokerConnError{
+		preq.resp <- PromisedResp{
+			err_msg:   BrokerConnError{
 				host:   b.meta.addr()
 				detail: err.msg()
 			}.msg()
@@ -229,7 +260,7 @@ fn (mut b Broker) dispatch(preq PromisedReq, mut conns map[int]&ConnState) {
 	}
 	// registering after the write is safe: the reader takes the entry
 	// first and only then reads the socket
-	st.inflight <- kmsg.Inflight{
+	st.inflight <- Inflight{
 		corr:     corr
 		flexible: response_header_is_flexible(preq.req)
 		key:      preq.req.key()
@@ -246,7 +277,7 @@ fn (mut b Broker) reader(mut st ConnState) {
 	for {
 		entry := <-st.inflight or { break } // closed by writer: exit
 		if failed {
-			entry.resp <- kmsg.PromisedResp{
+			entry.resp <- PromisedResp{
 				err_msg:   fail_msg
 				retriable: true
 			}
@@ -258,16 +289,16 @@ fn (mut b Broker) reader(mut st ConnState) {
 				h.on_broker_read(b.meta, entry.key, 0, time.now() - rstart, false)
 			}
 			failed = true
-			fail_msg = kmsg.BrokerConnError{
+			fail_msg = BrokerConnError{
 				host:   b.meta.addr()
 				detail: err.msg()
 			}.msg()
 			st.mu.lock()
 			st.dead = true
 			st.mu.unlock()
-			entry.resp <- kmsg.PromisedResp{
+			entry.resp <- PromisedResp{
 				err_msg:   fail_msg
-				retriable: err !is kmsg.ResponseTooLargeError
+				retriable: err !is ResponseTooLargeError
 			}
 			continue
 		}
@@ -281,14 +312,27 @@ fn (mut b Broker) reader(mut st ConnState) {
 			st.mu.lock()
 			st.dead = true
 			st.mu.unlock()
-			entry.resp <- kmsg.PromisedResp{
+			entry.resp <- PromisedResp{
 				err_msg:   fail_msg
 				retriable: true
 			}
 			continue
 		}
-		entry.resp <- kmsg.PromisedResp{
+		entry.resp <- PromisedResp{
 			body: body
+		}
+	}
+	// a retired connection is closed here, once its last response is read
+	st.mu.lock()
+	retired := st.retired && !st.closed
+	if retired {
+		st.closed = true
+	}
+	st.mu.unlock()
+	if retired {
+		st.conn.close() or {}
+		for mut h in b.cfg.hooks.on_disconnect {
+			h.on_broker_disconnect(b.meta)
 		}
 	}
 }
@@ -298,6 +342,7 @@ fn (mut b Broker) reader(mut st ConnState) {
 fn (mut b Broker) close_state(mut st ConnState) {
 	st.mu.lock()
 	already := st.closed
+	retired := st.retired
 	st.closed = true
 	st.dead = true
 	st.mu.unlock()
@@ -305,15 +350,31 @@ fn (mut b Broker) close_state(mut st ConnState) {
 		return
 	}
 	st.conn.close() or {}
-	st.inflight.close()
+	if !retired {
+		st.inflight.close()
+	}
 	for mut h in b.cfg.hooks.on_disconnect {
 		h.on_broker_disconnect(b.meta)
 	}
 }
 
+// retire_state stops sending on a connection whose SASL session is about
+// to expire. Its reader still answers every request already in flight,
+// then closes the socket; new requests go to a new, freshly authenticated
+// connection.
+fn (mut b Broker) retire_state(mut st ConnState) {
+	st.mu.lock()
+	skip := st.closed || st.retired
+	st.retired = true
+	st.mu.unlock()
+	if !skip {
+		st.inflight.close()
+	}
+}
+
 // request_api_versions negotiates ApiVersions with the broker and returns
 // the parsed response; the first step of the client request path.
-pub fn (b &Broker) request_api_versions() !ApiVersionsResponse {
+pub fn (b &Broker) request_api_versions() !kmsg.ApiVersionsResponse {
 	mut req := kmsg.ApiVersionsRequest{
 		version:                 3
 		client_software_name:    b.cfg.software_name
@@ -323,7 +384,7 @@ pub fn (b &Broker) request_api_versions() !ApiVersionsResponse {
 	mut resp := kmsg.ApiVersionsResponse{
 		version: req.version
 	}
-	mut r := kmsg.Reader{
+	mut r := kbin.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!

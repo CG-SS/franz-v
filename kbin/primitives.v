@@ -443,8 +443,7 @@ pub fn (mut b Reader) read_uint32() u32 {
 		b.invalidate()
 		return 0
 	}
-	r := u32(b.src[b.off]) << 24 | u32(b.src[b.off + 1]) << 16 | u32(b.src[b.off + 2]) << 8 | u32(b.src[
-		b.off + 3])
+	r := u32(b.src[b.off]) << 24 | u32(b.src[b.off + 1]) << 16 | u32(b.src[b.off + 2]) << 8 | u32(b.src[b.off + 3])
 	b.off += 4
 	return r
 }
@@ -515,13 +514,13 @@ pub fn (mut b Reader) read_uvarint() u32 {
 	return val
 }
 
-// span returns l bytes from the reader.
+// span returns a copy of the next l bytes from the reader.
 pub fn (mut b Reader) span(l int) []u8 {
 	if l < 0 || b.remaining() < l {
 		b.invalidate()
 		return []
 	}
-	r := b.src[b.off..b.off + l]
+	r := b.src[b.off..b.off + l].clone()
 	b.off += l
 	return r
 }

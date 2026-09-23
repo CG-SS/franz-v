@@ -4,6 +4,7 @@
 module kgo
 
 import kversion
+import sasl
 import time
 
 pub struct Config {
@@ -57,6 +58,10 @@ pub mut:
 	max_response_bytes int = 100 << 20
 	// max_versions caps the request versions the client will use.
 	max_versions kversion.Versions = kversion.stable()
+	// sasl, when non-empty, authenticates every broker connection with
+	// the first of these mechanisms the broker enables, e.g.
+	// `[sasl.Mechanism(sasl.Scram{ auth: sasl.ScramAuth{ user: 'u', pass: 'p' } })]`.
+	sasl []sasl.Mechanism
 	// logger receives client logs; silent by default.
 	logger Logger = Logger(NopLogger{})
 	// hooks observe client internals.

@@ -383,3 +383,135 @@ fn test_txn_eos_commit_and_abort() {
 	assert rv.bytestr() == 'in-late'
 	g3.close()
 }
+
+fn test_txn_sequences_wrap_at_max_int32() {
+	// Producer sequences are int32 values that wrap from max_i32 to 0, as
+	// in Kafka. Growing past max_i32 instead truncates to a negative base
+	// sequence on the wire, which brokers reject as out of order.
+	start := int(max_i32) - 1
+	mut cl := kfake.start(1, kfake.ClusterCfg{
+		initial_sequence: start
+	})
+	mut c := txn_client(cl, .read_committed)
+	defer {
+		c.close()
+	}
+	mut t := c.new_txn_producer('tx-wrap') or {
+		assert false, '${err}'
+		return
+	}
+	t.seqs['events/0'] = start
+	t.begin() or {
+		assert false, '${err}'
+		return
+	}
+	mut first := []Record{len: 3, init: Record{
+		value: 'first-${index}'.bytes()
+	}}
+	t.produce('events', mut first) or {
+		assert false, 'produce across max_i32: ${err}'
+		return
+	}
+	assert t.seqs['events/0'] == 1
+	mut second := []Record{len: 2, init: Record{
+		value: 'second-${index}'.bytes()
+	}}
+	t.produce('events', mut second) or {
+		assert false, 'produce after wrap: ${err}'
+		return
+	}
+	assert t.seqs['events/0'] == 3
+	t.commit() or {
+		assert false, 'commit: ${err}'
+		return
+	}
+	mut co := c.new_consumer(['events'], ConsumerOpts{}) or {
+		assert false, '${err}'
+		return
+	}
+	mut got := []Record{}
+	for _ in 0 .. 20 {
+		got << co.poll() or {
+			assert false, '${err}'
+			return
+		}
+		if got.len >= 5 {
+			break
+		}
+	}
+	assert got.len == 5
+	assert (got[4].value or { []u8{} }).bytestr() == 'second-1'
+}
+
+fn test_txn_restarted_producer_starts_a_new_sequence() {
+	// Restarting with the same transactional id bumps the producer epoch,
+	// and a new epoch starts its sequences at 0, which brokers require.
+	mut cl := kfake.start(1, kfake.ClusterCfg{})
+	mut c1 := txn_client(cl, .read_committed)
+	defer {
+		c1.close()
+	}
+	mut before := c1.new_txn_producer('tx-restart') or {
+		assert false, '${err}'
+		return
+	}
+	before.begin() or {
+		assert false, '${err}'
+		return
+	}
+	mut a := [Record{
+		value: 'before-0'.bytes()
+	}, Record{
+		value: 'before-1'.bytes()
+	}]
+	before.produce('events', mut a) or {
+		assert false, '${err}'
+		return
+	}
+	before.commit() or {
+		assert false, '${err}'
+		return
+	}
+
+	mut c2 := txn_client(cl, .read_committed)
+	defer {
+		c2.close()
+	}
+	mut after := c2.new_txn_producer('tx-restart') or {
+		assert false, '${err}'
+		return
+	}
+	after.begin() or {
+		assert false, '${err}'
+		return
+	}
+	mut b := [Record{
+		value: 'after-0'.bytes()
+	}]
+	after.produce('events', mut b) or {
+		assert false, 'first produce of the new epoch: ${err}'
+		return
+	}
+	after.commit() or {
+		assert false, '${err}'
+		return
+	}
+	mut co := c2.new_consumer(['events'], ConsumerOpts{}) or {
+		assert false, '${err}'
+		return
+	}
+	mut got := []string{}
+	for _ in 0 .. 20 {
+		recs := co.poll() or {
+			assert false, '${err}'
+			return
+		}
+		for r in recs {
+			got << (r.value or { []u8{} }).bytestr()
+		}
+		if got.len >= 3 {
+			break
+		}
+	}
+	assert got == ['before-0', 'before-1', 'after-0']
+}

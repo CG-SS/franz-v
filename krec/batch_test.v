@@ -99,3 +99,12 @@ fn test_parse_record_batches_skips_control() {
 	v := flat[0].value or { []u8{} }
 	assert v.bytestr() == 'user data'
 }
+
+fn test_next_sequence_wraps_like_kafka() {
+	assert next_sequence(0, 3) == 3
+	assert next_sequence(max_i32 - 3, 3) == max_i32
+	assert next_sequence(max_i32 - 2, 3) == 0
+	assert next_sequence(max_i32 - 1, 3) == 1
+	assert next_sequence(max_i32, 1) == 0
+	assert next_sequence(max_i32, 5) == 4
+}
