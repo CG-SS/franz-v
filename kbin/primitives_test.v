@@ -125,7 +125,9 @@ fn test_varint_decode_errors() {
 fn test_varint_random_roundtrip() {
 	mut rng := Rng{}
 	for _ in 0 .. 2000 {
-		i := int(rng.next())
+		// varints carry int32s; int is 64 bits wide on 64-bit targets, so
+		// narrow through i32 to stay in the wire range
+		i := int(i32(rng.next()))
 		mut w := Writer{}
 		w.write_varint(i)
 		assert w.buf.len == varint_len(i)
@@ -163,6 +165,18 @@ fn test_fixed_width_byte_order() {
 	assert r.read_uint32() == u32(0xdeadbeef)
 	assert r.remaining() == 0
 	r.complete() or { assert false, 'reader should be complete: ${err}' }
+
+	// negative int32s must sign-extend: -1 is the null length marker
+	mut nw := Writer{}
+	nw.write_int32(-1)
+	nw.write_int32(-2147483648)
+	assert nw.buf == [u8(0xff), 0xff, 0xff, 0xff, 0x80, 0x00, 0x00, 0x00]
+	mut nr := Reader{
+		src: nw.buf
+	}
+	assert nr.read_int32() == -1
+	assert nr.read_int32() == -2147483648
+	assert nr.ok()
 }
 
 fn test_fixed_width_random_roundtrip() {
@@ -171,7 +185,7 @@ fn test_fixed_width_random_roundtrip() {
 		b := rng.next() & 1 == 1
 		i8v := i8(rng.next())
 		i16v := i16(rng.next())
-		i32v := int(rng.next())
+		i32v := int(i32(rng.next()))
 		i64v := i64(rng.next())
 		u16v := u16(rng.next())
 		u32v := u32(rng.next())

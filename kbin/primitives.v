@@ -14,9 +14,11 @@
 // matches how generated decoders want to read anyway.
 //
 // Kafka type mapping used throughout this module:
-//   int8 -> i8, int16 -> i16, int32 -> int (V int is always 32 bits),
-//   int64 -> i64, uint16 -> u16, uint32 -> u32, float64 -> f64,
-//   uuid -> [16]u8, nullable string -> ?string, nullable bytes -> ?[]u8.
+//   int8 -> i8, int16 -> i16, int32 -> int, int64 -> i64, uint16 -> u16,
+//   uint32 -> u32, float64 -> f64, uuid -> [16]u8,
+//   nullable string -> ?string, nullable bytes -> ?[]u8.
+// V's int is 64 bits wide on 64-bit targets (32 on 32-bit ones), so int32
+// reads sign-extend through i32 and writes keep the low 32 bits.
 module kbin
 
 import math
@@ -430,7 +432,9 @@ pub fn (mut b Reader) read_uint16() u16 {
 
 // read_int32 returns a big endian int32 from the reader.
 pub fn (mut b Reader) read_int32() int {
-	return int(b.read_uint32())
+	// Go through i32 so negative values (e.g. -1 null lengths) sign-extend
+	// when int is 64 bits wide.
+	return int(i32(b.read_uint32()))
 }
 
 // read_uint32 returns a big endian uint32 from the reader.
