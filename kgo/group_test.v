@@ -3,17 +3,17 @@ module kgo
 import kfake
 import time
 
-const fast = GroupOpts{
+const fast = kfake.GroupOpts{
 	heartbeat_interval: 30 * time.millisecond
 }
 
 fn test_balancers() {
 	subs := [
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id: 'a'
 			topics:    ['t']
 		},
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id: 'b'
 			topics:    ['t']
 		},
@@ -32,11 +32,11 @@ fn test_balancers() {
 
 	// range with a topic only one member subscribes to
 	subs2 := [
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id: 'a'
 			topics:    ['t', 'u']
 		},
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id: 'b'
 			topics:    ['t']
 		},
@@ -56,7 +56,7 @@ fn test_group_single_member_lifecycle() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{
 		partitions_per_topic: 2
 	})
-	mut c := new_client(Config{
+	mut c := new_client(kfake.Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 100 * time.millisecond
 	}) or {
@@ -66,9 +66,9 @@ fn test_group_single_member_lifecycle() {
 	defer {
 		c.close()
 	}
-	mut records := []Record{}
+	mut records := []kfake.Record{}
 	for i in 0 .. 6 {
-		records << Record{
+		records << kfake.Record{
 			partition: i % 2
 			value:     'v${i}'.bytes()
 		}
@@ -109,7 +109,7 @@ fn test_group_single_member_lifecycle() {
 	assert none_new.len == 0
 
 	mut more := [
-		Record{
+		kfake.Record{
 			partition: 0
 			value:     'post-commit'.bytes()
 		},
@@ -132,7 +132,7 @@ fn test_group_two_members_rebalance() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{
 		partitions_per_topic: 2
 	})
-	mut c := new_client(Config{
+	mut c := new_client(kfake.Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 50 * time.millisecond
 	}) or {
@@ -144,7 +144,7 @@ fn test_group_two_members_rebalance() {
 	}
 	// one client per member: members share nothing, matching real
 	// coordinator semantics (serial per-connection processing)
-	mut cm2 := new_client(Config{
+	mut cm2 := new_client(kfake.Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 50 * time.millisecond
 	}) or {
@@ -202,11 +202,11 @@ fn test_group_two_members_rebalance() {
 
 	// records to each partition arrive at exactly one member
 	mut records := [
-		Record{
+		kfake.Record{
 			partition: 0
 			value:     'to-p0'.bytes()
 		},
-		Record{
+		kfake.Record{
 			partition: 1
 			value:     'to-p1'.bytes()
 		},
@@ -215,8 +215,8 @@ fn test_group_two_members_rebalance() {
 		assert false, '${err}'
 		return
 	}
-	mut got1 := []Record{}
-	mut got2 := []Record{}
+	mut got1 := []kfake.Record{}
+	mut got2 := []kfake.Record{}
 	for _ in 0 .. 40 {
 		got1 << g1.poll() or {
 			assert false, '${err}'
@@ -254,10 +254,89 @@ fn test_group_two_members_rebalance() {
 	g1.close()
 }
 
+fn test_group_follower_refreshes_stale_metadata() {
+	// Both clients cache metadata when their consumer is created, and the
+	// broker still lists the topic without partitions (as right after
+	// CreateTopics). The leader refreshes before balancing; the follower
+	// must also refresh before positioning its partitions rather than
+	// fail on its stale cache (seen against Kafka 4.3.1 in
+	// examples/group_smoke.v).
+	mut cl := kfake.start(1, kfake.ClusterCfg{
+		partitions_per_topic:   2
+		pending_topic_metadata: 2
+	})
+	mut c1 := new_client(kfake.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 50 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c1.close()
+	}
+	mut c2 := new_client(kfake.Config{
+		seed_brokers:   [cl.seed_addr()]
+		fetch_max_wait: 50 * time.millisecond
+	}) or {
+		assert false, '${err}'
+		return
+	}
+	defer {
+		c2.close()
+	}
+	mut g1 := c1.new_group_consumer('stale', ['events'], fast) or {
+		assert false, '${err}'
+		return
+	}
+	mut g2 := c2.new_group_consumer('stale', ['events'], fast) or {
+		assert false, '${err}'
+		return
+	}
+	// g1 joins alone and leads
+	g1.poll() or {
+		assert false, 'g1 first poll: ${err}'
+		return
+	}
+	assert g1.assigned()['events'].len == 2
+
+	// g2 follows: it is handed a partition its cache knows nothing about
+	result := chan string{cap: 1}
+	spawn fn (mut g2 GroupConsumer, result chan string) {
+		g2.poll() or {
+			result <- err.msg()
+			return
+		}
+		result <- ''
+	}(mut g2, result)
+	mut settled := false
+	for _ in 0 .. 100 {
+		time.sleep(40 * time.millisecond)
+		g1.poll() or {
+			assert false, 'g1 poll during rebalance: ${err}'
+			return
+		}
+		if g1.assigned()['events'].len == 1 {
+			settled = true
+			break
+		}
+	}
+	assert settled, 'rebalance never settled'
+	g2_err := <-result
+	assert g2_err == '', 'g2 first poll: ${g2_err}'
+	assert g2.assigned()['events'].len == 1
+	g2.poll() or {
+		assert false, 'g2 poll: ${err}'
+		return
+	}
+	g2.close()
+	g1.close()
+}
+
 fn test_cooperative_sticky_balancer() {
 	// sole member owns everything, balanced: nothing moves
 	solo := [
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id:  'a'
 			topics:     ['t']
 			owned:      {
@@ -274,7 +353,7 @@ fn test_cooperative_sticky_balancer() {
 
 	// second member joins: round 1 revokes the excess to nobody
 	two := [
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id:  'a'
 			topics:     ['t']
 			owned:      {
@@ -282,7 +361,7 @@ fn test_cooperative_sticky_balancer() {
 			}
 			generation: 1
 		},
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id: 'b'
 			topics:    ['t']
 		},
@@ -292,7 +371,7 @@ fn test_cooperative_sticky_balancer() {
 	assert ('t' in r1['b']) == false // cooperative: not handed over yet
 	// round 2: a rejoins owning only its kept share; freed parts land on b
 	two2 := [
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id:  'a'
 			topics:     ['t']
 			owned:      {
@@ -300,7 +379,7 @@ fn test_cooperative_sticky_balancer() {
 			}
 			generation: 2
 		},
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id:  'b'
 			topics:     ['t']
 			generation: 2
@@ -312,7 +391,7 @@ fn test_cooperative_sticky_balancer() {
 
 	// duplicate claim: higher generation wins
 	dup := [
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id:  'stale'
 			topics:     ['t']
 			owned:      {
@@ -320,7 +399,7 @@ fn test_cooperative_sticky_balancer() {
 			}
 			generation: 1
 		},
-		MemberSubscription{
+		kfake.MemberSubscription{
 			member_id:  'fresh'
 			topics:     ['t']
 			owned:      {
@@ -339,7 +418,7 @@ fn test_cooperative_sticky_balancer() {
 struct CoopStatus {
 	who      int
 	assigned []int
-	records  []Record
+	records  []kfake.Record
 }
 
 fn coop_member_loop(who int, mut g GroupConsumer, mut stop Cancel, status chan CoopStatus) {
@@ -348,7 +427,7 @@ fn coop_member_loop(who int, mut g GroupConsumer, mut stop Cancel, status chan C
 			time.sleep(30 * time.millisecond)
 			continue
 		}
-		st := CoopStatus{
+		st := kfake.CoopStatus{
 			who:      who
 			assigned: g.assigned()['events'] or { []int{} }
 			records:  records
@@ -366,11 +445,11 @@ fn test_cooperative_group_rebalance_preserves_cursors() {
 	mut cl := kfake.start(1, kfake.ClusterCfg{
 		partitions_per_topic: 4
 	})
-	coop := GroupOpts{
-		balancers:          [BalancerKind.cooperative_sticky]
+	coop := kfake.GroupOpts{
+		balancers:          [kfake.BalancerKind.cooperative_sticky]
 		heartbeat_interval: 30 * time.millisecond
 	}
-	mut c1 := new_client(Config{
+	mut c1 := new_client(kfake.Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 50 * time.millisecond
 	}) or {
@@ -380,7 +459,7 @@ fn test_cooperative_group_rebalance_preserves_cursors() {
 	defer {
 		c1.close()
 	}
-	mut c2 := new_client(Config{
+	mut c2 := new_client(kfake.Config{
 		seed_brokers:   [cl.seed_addr()]
 		fetch_max_wait: 50 * time.millisecond
 	}) or {
@@ -391,9 +470,9 @@ fn test_cooperative_group_rebalance_preserves_cursors() {
 		c2.close()
 	}
 
-	mut records := []Record{}
+	mut records := []kfake.Record{}
 	for p in 0 .. 4 {
-		records << Record{
+		records << kfake.Record{
 			partition: p
 			value:     'old-p${p}'.bytes()
 		}
@@ -408,7 +487,7 @@ fn test_cooperative_group_rebalance_preserves_cursors() {
 		assert false, '${err}'
 		return
 	}
-	mut first := []Record{}
+	mut first := []kfake.Record{}
 	for _ in 0 .. 40 {
 		first << g1.poll() or {
 			assert false, '${err}'
@@ -428,12 +507,12 @@ fn test_cooperative_group_rebalance_preserves_cursors() {
 		return
 	}
 	mut stop := new_cancel()
-	status := chan CoopStatus{cap: 64}
+	status := chan kfake.CoopStatus{cap: 64}
 	spawn coop_member_loop(1, mut g1, mut stop, status)
 	spawn coop_member_loop(2, mut g2, mut stop, status)
 
 	mut asg := map[int][]int{}
-	mut got := map[int][]Record{}
+	mut got := map[int][]kfake.Record{}
 	got[1] = []
 	got[2] = []
 	mut settled := false
@@ -466,9 +545,9 @@ fn test_cooperative_group_rebalance_preserves_cursors() {
 
 	// continuity: new record per partition; without any commits, g1 must
 	// yield only new records (cursors preserved); g2 re-reads its history
-	mut fresh := []Record{}
+	mut fresh := []kfake.Record{}
 	for p in 0 .. 4 {
-		fresh << Record{
+		fresh << kfake.Record{
 			partition: p
 			value:     'new-p${p}'.bytes()
 		}

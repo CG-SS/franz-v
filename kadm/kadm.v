@@ -12,12 +12,12 @@ import kmsg
 // Admin wraps a kgo.Client with admin conveniences.
 pub struct Admin {
 pub mut:
-	client &kgo.Client
+	client &kmsg.Client
 }
 
 // new builds an Admin over an existing client.
-pub fn new(c &kgo.Client) &Admin {
-	return &Admin{
+pub fn new(c &Client) &Admin {
+	return &kmsg.Admin{
 		client: c
 	}
 }
@@ -40,12 +40,12 @@ pub fn (r OpResult) ok() ! {
 
 fn code_result(name string, code i16) OpResult {
 	if code == 0 {
-		return OpResult{
+		return kmsg.OpResult{
 			name: name
 		}
 	}
-	e := kerr.error_for_code(code) or { kerr.unknown_server_error }
-	return OpResult{
+	e := kmsg.error_for_code(code) or { kmsg.unknown_server_error }
+	return kmsg.OpResult{
 		name:    name
 		code:    code
 		err_msg: e.msg()
@@ -91,11 +91,11 @@ pub fn (mut a Admin) create_topics(specs []TopicSpec) ![]OpResult {
 	mut resp := kmsg.CreateTopicsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
-	mut out := []OpResult{cap: resp.topics.len}
+	mut out := []kmsg.OpResult{cap: resp.topics.len}
 	for t in resp.topics {
 		out << code_result(t.topic, t.error_code)
 	}
@@ -115,11 +115,11 @@ pub fn (mut a Admin) delete_topics(names []string) ![]OpResult {
 	mut resp := kmsg.DeleteTopicsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
-	mut out := []OpResult{cap: resp.topics.len}
+	mut out := []kmsg.OpResult{cap: resp.topics.len}
 	for t in resp.topics {
 		out << code_result(t.topic or { '' }, t.error_code)
 	}
@@ -142,7 +142,7 @@ pub:
 	topic      string
 	topic_id   [16]u8
 	internal   bool
-	partitions []PartitionDetail
+	partitions []kmsg.PartitionDetail
 }
 
 // list_topics lists all topics with partition placement; internal topics
@@ -150,15 +150,15 @@ pub:
 pub fn (mut a Admin) list_topics(include_internal bool) ![]TopicDetail {
 	mut c := a.client
 	resp := c.metadata([])!
-	mut out := []TopicDetail{}
+	mut out := []kmsg.TopicDetail{}
 	for t in resp.topics {
 		name := t.topic or { continue }
 		if !include_internal && name.starts_with('__') {
 			continue
 		}
-		mut parts := []PartitionDetail{cap: t.partitions.len}
+		mut parts := []kmsg.PartitionDetail{cap: t.partitions.len}
 		for p in t.partitions {
-			parts << PartitionDetail{
+			parts << kmsg.PartitionDetail{
 				partition: p.partition
 				leader:    p.leader
 				replicas:  p.replicas.clone()
@@ -166,7 +166,7 @@ pub fn (mut a Admin) list_topics(include_internal bool) ![]TopicDetail {
 			}
 		}
 		parts.sort(a.partition < b.partition)
-		out << TopicDetail{
+		out << kmsg.TopicDetail{
 			topic:      name
 			topic_id:   t.topic_id
 			internal:   t.is_internal
@@ -193,13 +193,13 @@ pub fn (mut a Admin) create_partitions(topic string, total int) ! {
 	mut resp := kmsg.CreatePartitionsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
 	for t in resp.topics {
 		if t.error_code != 0 {
-			e := kerr.error_for_code(t.error_code) or { kerr.unknown_server_error }
+			e := kmsg.error_for_code(t.error_code) or { kmsg.unknown_server_error }
 			return error('create partitions ${t.topic}: ${e.msg()}')
 		}
 	}
@@ -235,18 +235,18 @@ pub fn (mut a Admin) describe_topic_configs(topic string) ![]ConfigEntry {
 	mut resp := kmsg.DescribeConfigsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
-	mut out := []ConfigEntry{}
+	mut out := []kmsg.ConfigEntry{}
 	for res in resp.resources {
 		if res.error_code != 0 {
-			e := kerr.error_for_code(res.error_code) or { kerr.unknown_server_error }
+			e := kmsg.error_for_code(res.error_code) or { kmsg.unknown_server_error }
 			return error('describe configs ${topic}: ${e.msg()}')
 		}
 		for cfg in res.configs {
-			out << ConfigEntry{
+			out << kmsg.ConfigEntry{
 				name:       cfg.name
 				value:      cfg.value
 				read_only:  cfg.read_only
@@ -287,13 +287,13 @@ pub fn (mut a Admin) alter_topic_configs(topic string, set map[string]string, de
 	mut resp := kmsg.IncrementalAlterConfigsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
 	for rres in resp.resources {
 		if rres.error_code != 0 {
-			e := kerr.error_for_code(rres.error_code) or { kerr.unknown_server_error }
+			e := kmsg.error_for_code(rres.error_code) or { kmsg.unknown_server_error }
 			return error('alter configs ${topic}: ${e.msg()}')
 		}
 	}
@@ -314,12 +314,12 @@ fn (mut a Admin) find_group_coordinator(group string) !int {
 	mut resp := kmsg.FindCoordinatorResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
 	if resp.error_code != 0 {
-		e := kerr.error_for_code(resp.error_code) or { kerr.unknown_server_error }
+		e := kmsg.error_for_code(resp.error_code) or { kmsg.unknown_server_error }
 		return error('find coordinator: ${e.msg()}')
 	}
 	return resp.node_id
@@ -340,14 +340,14 @@ pub fn (mut a Admin) list_groups() ![]GroupListing {
 		c.metadata([])!
 	}
 	mut seen := map[string]bool{}
-	mut out := []GroupListing{}
+	mut out := []kmsg.GroupListing{}
 	for node in c.known_brokers() {
 		mut req := kmsg.ListGroupsRequest{}
 		body := c.request_broker(node, mut req)!
 		mut resp := kmsg.ListGroupsResponse{
 			version: req.version
 		}
-		mut r := kbin.Reader{
+		mut r := kmsg.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
@@ -356,7 +356,7 @@ pub fn (mut a Admin) list_groups() ![]GroupListing {
 				continue
 			}
 			seen[g.group] = true
-			out << GroupListing{
+			out << kmsg.GroupListing{
 				group:         g.group
 				protocol_type: g.protocol_type
 				state:         g.group_state
@@ -383,7 +383,7 @@ pub:
 	state         string
 	protocol_type string
 	protocol      string
-	members       []GroupMember
+	members       []kmsg.GroupMember
 }
 
 // describe_group describes one group, decoding member assignments.
@@ -397,7 +397,7 @@ pub fn (mut a Admin) describe_group(group string) !GroupDescription {
 	mut resp := kmsg.DescribeGroupsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -406,23 +406,23 @@ pub fn (mut a Admin) describe_group(group string) !GroupDescription {
 	}
 	g := resp.groups[0]
 	if g.error_code != 0 {
-		e := kerr.error_for_code(g.error_code) or { kerr.unknown_server_error }
+		e := kmsg.error_for_code(g.error_code) or { kmsg.unknown_server_error }
 		return error('describe group ${group}: ${e.msg()}')
 	}
-	mut members := []GroupMember{cap: g.members.len}
+	mut members := []kmsg.GroupMember{cap: g.members.len}
 	for m in g.members {
 		mut assigned := map[string][]int{}
 		if m.member_assignment.len > 0 {
 			mut asg := kmsg.ConsumerMemberAssignment{}
-			mut ar := kbin.Reader{
+			mut ar := kmsg.Reader{
 				src: m.member_assignment
 			}
-			asg.read_from(mut ar) or { kmsg.ConsumerMemberAssignment{} }
+			asg.read_from(mut ar) or { asg = kmsg.ConsumerMemberAssignment{} }
 			for t in asg.topics {
 				assigned[t.topic] = t.partitions.clone()
 			}
 		}
-		members << GroupMember{
+		members << kmsg.GroupMember{
 			member_id:   m.member_id
 			client_id:   m.client_id
 			client_host: m.client_host
@@ -430,7 +430,7 @@ pub fn (mut a Admin) describe_group(group string) !GroupDescription {
 		}
 	}
 	members.sort(a.member_id < b.member_id)
-	return GroupDescription{
+	return kmsg.GroupDescription{
 		group:         g.group
 		state:         g.state
 		protocol_type: g.protocol_type
@@ -442,7 +442,7 @@ pub fn (mut a Admin) describe_group(group string) !GroupDescription {
 // delete_groups deletes groups (they must be empty), one result each.
 pub fn (mut a Admin) delete_groups(groups []string) ![]OpResult {
 	mut c := a.client
-	mut out := []OpResult{}
+	mut out := []kmsg.OpResult{}
 	for group in groups {
 		coordinator := a.find_group_coordinator(group)!
 		mut req := kmsg.DeleteGroupsRequest{
@@ -452,7 +452,7 @@ pub fn (mut a Admin) delete_groups(groups []string) ![]OpResult {
 		mut resp := kmsg.DeleteGroupsResponse{
 			version: req.version
 		}
-		mut r := kbin.Reader{
+		mut r := kmsg.Reader{
 			src: body
 		}
 		resp.read_from(mut r)!
@@ -481,7 +481,7 @@ pub fn (mut a Admin) fetch_group_offsets(group string) !map[string]i64 {
 	mut resp := kmsg.OffsetFetchResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
@@ -550,7 +550,7 @@ pub fn (mut a Admin) group_lag(group string) ![]LagEntry {
 		idx := key.last_index('/') or { continue }
 		topics[key[..idx]] = true
 	}
-	desc := a.describe_group(group) or { GroupDescription{} }
+	desc := a.describe_group(group) or { kmsg.GroupDescription{} }
 	for m in desc.members {
 		for topic, _ in m.assigned {
 			topics[topic] = true
@@ -559,12 +559,12 @@ pub fn (mut a Admin) group_lag(group string) ![]LagEntry {
 	mut names := topics.keys()
 	names.sort()
 	ends := a.list_end_offsets(names)!
-	mut out := []LagEntry{}
+	mut out := []kmsg.LagEntry{}
 	for key, end in ends {
 		idx := key.last_index('/') or { continue }
 		committed_off := committed[key] or { i64(-1) }
 		base := if committed_off >= 0 { committed_off } else { i64(0) }
-		out << LagEntry{
+		out << kmsg.LagEntry{
 			topic:     key[..idx]
 			partition: key[idx + 1..].int()
 			committed: committed_off
@@ -586,9 +586,7 @@ pub fn (mut a Admin) group_lag(group string) ![]LagEntry {
 pub fn (mut a Admin) delete_records(topic string, partition int, before_offset i64) !i64 {
 	mut c := a.client
 	c.metadata([topic])!
-	leader := c.partition_leader(topic, partition) or {
-		return error('no leader for ${topic}[${partition}]')
-	}
+	leader := c.leader_for(topic, partition)!
 	mut req := kmsg.DeleteRecordsRequest{
 		timeout_millis: 15000
 		topics:         [
@@ -607,14 +605,14 @@ pub fn (mut a Admin) delete_records(topic string, partition int, before_offset i
 	mut resp := kmsg.DeleteRecordsResponse{
 		version: req.version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	resp.read_from(mut r)!
 	for t in resp.topics {
 		for p in t.partitions {
 			if p.error_code != 0 {
-				e := kerr.error_for_code(p.error_code) or { kerr.unknown_server_error }
+				e := kmsg.error_for_code(p.error_code) or { kmsg.unknown_server_error }
 				return error('delete records ${topic}[${p.partition}]: ${e.msg()}')
 			}
 			return p.low_watermark

@@ -1,6 +1,7 @@
 module kgo
 
 import kbin
+import kfake
 import kmsg
 import net
 import sync

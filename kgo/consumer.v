@@ -54,9 +54,7 @@ pub fn (mut c Client) new_consumer(topics []string, opts ConsumerOpts) !&Consume
 		// group partitions per leader for ListOffsets
 		mut by_leader := map[int][]int{}
 		for p in 0 .. nparts {
-			leader := c.partition_leader(topic, p) or {
-				return error('no leader for ${topic}[${p}]')
-			}
+			leader := c.leader_for(topic, p)!
 			by_leader[leader] << p
 		}
 		for leader, parts in by_leader {
@@ -139,12 +137,7 @@ pub fn (mut co Consumer) poll() ![]Record {
 		idx := key.last_index('/') or { continue }
 		topic := key[..idx]
 		partition := key[idx + 1..].int()
-		leader := c.partition_leader(topic, partition) or {
-			c.metadata([topic])!
-			c.partition_leader(topic, partition) or {
-				return error('no leader for ${topic}[${partition}]')
-			}
-		}
+		leader := c.leader_for(topic, partition)!
 		if topic !in leader_topics[leader] {
 			leader_topics[leader][topic] = FetchTarget{
 				topic: topic
@@ -291,9 +284,7 @@ fn (mut co Consumer) handle_partition_error(topic string, partition int, code i1
 	match code {
 		1 { // OFFSET_OUT_OF_RANGE: reset per policy
 			ts := if c.cfg.offset_reset == .earliest { i64(-2) } else { i64(-1) }
-			leader := c.partition_leader(topic, partition) or {
-				return error('no leader for ${topic}[${partition}]')
-			}
+			leader := c.leader_for(topic, partition)!
 			offsets := c.list_offsets(leader, topic, [partition], ts)!
 			co.cursors[cursor_key(topic, partition)] = offsets[partition]
 			c.cfg.log(.info,

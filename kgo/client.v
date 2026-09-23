@@ -364,7 +364,9 @@ pub fn (mut c Client) cached_metadata() ?kmsg.MetadataResponse {
 }
 
 // partition_leader returns the node id leading the given partition,
-// according to cached metadata.
+// according to cached metadata; none if the partition is unknown or has no
+// leader right now. Kafka reports a missing leader as -1, which must not be
+// used as a node id: negative ids address the seed brokers.
 pub fn (mut c Client) partition_leader(topic string, partition int) ?int {
 	c.mu.lock()
 	defer {
@@ -378,11 +380,35 @@ pub fn (mut c Client) partition_leader(topic string, partition int) ?int {
 		}
 		for p in t.partitions {
 			if p.partition == partition {
+				if p.leader < 0 {
+					return none
+				}
 				return p.leader
 			}
 		}
 	}
 	return none
+}
+
+// leader_for returns the node id leading the given partition. While it is
+// unknown, metadata is refreshed right away and then retried with backoff
+// (cfg.request_retries times): cached metadata can predate the broker
+// applying a just-created topic or a leader election, so a cache miss
+// alone is not an error.
+pub fn (mut c Client) leader_for(topic string, partition int) !int {
+	for attempt := 0; attempt <= c.cfg.request_retries + 1; attempt++ {
+		if leader := c.partition_leader(topic, partition) {
+			return leader
+		}
+		if attempt > c.cfg.request_retries {
+			break
+		}
+		if attempt > 0 {
+			time.sleep(c.cfg.backoff_for(attempt - 1))
+		}
+		c.metadata([topic])!
+	}
+	return error('no leader for ${topic}[${partition}]')
 }
 
 // topic_id returns the KIP-516 uuid of a topic, once learned from

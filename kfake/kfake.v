@@ -63,13 +63,18 @@ pub mut:
 	// kill_after_requests, when > 0, closes each connection after
 	// serving this many requests on it (mid-stream failure injection).
 	kill_after_requests int
+	// pending_topic_metadata answers this many first Metadata requests
+	// as if every requested topic were still being created: listed with
+	// LEADER_NOT_AVAILABLE and no partitions, like a broker that has not
+	// yet applied a just-created topic.
+	pending_topic_metadata int
 }
 
 // Cluster is a running fake cluster.
 @[heap]
 pub struct Cluster {
 pub:
-	cfg   ClusterCfg
+	cfg   kmsg.ClusterCfg
 	nodes int
 pub mut:
 	ports []int
@@ -77,13 +82,13 @@ mut:
 	mu          &sync.Mutex = sync.new_mutex()
 	fails       int
 	conns       map[int]int                   // node -> connections accepted
-	stored      map[string][]StoredBatch // 'topic/partition' -> batches
-	groups      map[string]&FakeGroup
+	stored      map[string][]kmsg.StoredBatch // 'topic/partition' -> batches
+	groups      map[string]&kmsg.FakeGroup
 	next_member int
-	txns        map[string]&FakeTxn       // transactional_id -> state
+	txns        map[string]&kmsg.FakeTxn       // transactional_id -> state
 	pid_epoch   map[i64]i16                    // producer id -> current epoch (fencing)
 	seqs        map[string]int                 // 'pid/topic/partition' -> next sequence
-	aborted     map[string][]AbortedRange // 'topic/partition' -> aborted ranges
+	aborted     map[string][]kmsg.AbortedRange // 'topic/partition' -> aborted ranges
 	open_txn    map[string]i64                 // 'topic/partition/pid' -> open txn first offset
 	next_pid    i64 = 1000
 	topics      map[string]int               // topic -> partition count (registry)
@@ -91,14 +96,17 @@ mut:
 	log_start   map[string]i64               // 'topic/partition' -> log start offset
 	topic_uuids map[string][16]u8
 	uuid_names  map[string]string
+	// pending counts down the Metadata answers still served pending.
+	pending int
 }
 
 // start launches a fake cluster with the given node count.
 pub fn start(nodes int, cfg ClusterCfg) &Cluster {
-	mut cl := &Cluster{
-		cfg:   cfg
-		nodes: nodes
-		fails: cfg.fail_first_conns
+	mut cl := &kmsg.Cluster{
+		cfg:     cfg
+		nodes:   nodes
+		fails:   cfg.fail_first_conns
+		pending: cfg.pending_topic_metadata
 	}
 	mut listeners := []&net.TcpListener{}
 	for _ in 0 .. nodes {
@@ -121,12 +129,12 @@ pub fn (cl &Cluster) seed_addr() string {
 // records returns a copy of every user record produced to
 // topic/partition in offset order (control markers excluded, aborted
 // records included).
-pub fn (mut cl Cluster) records(topic string, partition int) []krec.Record {
+pub fn (mut cl Cluster) records(topic string, partition int) []Record {
 	cl.mu.lock()
 	defer {
 		cl.mu.unlock()
 	}
-	mut out := []krec.Record{}
+	mut out := []kmsg.Record{}
 	for b in cl.stored['${topic}/${partition}'] {
 		if b.control {
 			continue
@@ -197,7 +205,7 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			conn.close() or {}
 			return
 		}
-		mut sr := kbin.Reader{
+		mut sr := kmsg.Reader{
 			src: size_buf
 		}
 		size := sr.read_int32()
@@ -207,7 +215,7 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			return
 		}
 
-		mut r := kbin.Reader{
+		mut r := kmsg.Reader{
 			src: payload
 		}
 		key := r.read_int16()
@@ -264,12 +272,12 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 			else { []u8{} }
 		}
 
-		mut hdr := kbin.Writer{}
+		mut hdr := kmsg.Writer{}
 		hdr.write_int32(corr)
 		if flexible && key != 18 {
 			hdr.write_uvarint(0)
 		}
-		mut framed := kbin.Writer{}
+		mut framed := kmsg.Writer{}
 		framed.write_int32(hdr.buf.len + resp_body.len)
 		framed.buf << hdr.buf
 		framed.buf << resp_body
@@ -285,7 +293,7 @@ fn (mut cl Cluster) serve_conn(node_id int, mut conn net.TcpConn) {
 	}
 }
 
-fn (cl &Cluster) api_keys() []kmsg.ApiVersionsResponseApiKey {
+fn (cl &Cluster) api_keys() []ApiVersionsResponseApiKey {
 	mut keys := []kmsg.ApiVersionsResponseApiKey{}
 	for k, v in cl.cfg.advertised {
 		keys << kmsg.ApiVersionsResponseApiKey{
@@ -305,7 +313,7 @@ fn (mut cl Cluster) answer_api_versions(body []u8, version i16) []u8 {
 			error_code: 35
 			api_keys:   cl.api_keys()
 		}
-		mut w := kbin.Writer{}
+		mut w := kmsg.Writer{}
 		resp.write_to(mut w)
 		return w.buf
 	}
@@ -313,7 +321,7 @@ fn (mut cl Cluster) answer_api_versions(body []u8, version i16) []u8 {
 		version:  version
 		api_keys: cl.api_keys()
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -322,7 +330,7 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 	mut req := kmsg.MetadataRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -342,6 +350,12 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 		cluster_id:    'kfake'
 		controller_id: node_id
 	}
+	cl.mu.lock()
+	pending := cl.pending > 0
+	if pending {
+		cl.pending--
+	}
+	cl.mu.unlock()
 	for t in req_topics {
 		tname0 := t.topic or { '' }
 		cl.mu.lock()
@@ -351,6 +365,13 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 		}
 		nparts := cl.topics[tname0]
 		cl.mu.unlock()
+		if pending {
+			resp.topics << kmsg.MetadataResponseTopic{
+				error_code: 5 // LEADER_NOT_AVAILABLE
+				topic:      t.topic
+			}
+			continue
+		}
 		mut partitions := []kmsg.MetadataResponseTopicPartition{}
 		for p in 0 .. nparts {
 			partitions << kmsg.MetadataResponseTopicPartition{
@@ -373,7 +394,7 @@ fn (mut cl Cluster) answer_metadata(node_id int, body []u8, version i16) []u8 {
 			port:    port
 		}
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -385,7 +406,7 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 	mut req := kmsg.ProduceRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -410,7 +431,7 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 			mut base_offset := i64(-1)
 			if code == 0 {
 				batch_bytes := p.records or { []u8{} }
-				meta, mut recs := krec.parse_record_batch(batch_bytes) or {
+				meta, mut recs := kmsg.parse_record_batch(batch_bytes) or {
 					resp_topic.partitions << kmsg.ProduceResponseTopicPartition{
 						partition:  p.partition
 						error_code: 2 // CORRUPT_MESSAGE
@@ -440,19 +461,19 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 						rec.partition = p.partition
 						rec.offset += base_offset
 					}
-					if krec.is_transactional(meta) {
+					if kmsg.is_transactional(meta) {
 						okey := '${skey}/${meta.producer_id}'
 						if okey !in cl.open_txn {
 							cl.open_txn[okey] = base_offset
 						}
 					}
-					cl.stored[skey] << StoredBatch{
+					cl.stored[skey] << kmsg.StoredBatch{
 						base_offset:   base_offset
 						records:       recs
 						pid:           meta.producer_id
 						epoch:         meta.producer_epoch
 						base_sequence: meta.first_sequence
-						transactional: krec.is_transactional(meta)
+						transactional: kmsg.is_transactional(meta)
 					}
 				}
 				cl.mu.unlock()
@@ -465,7 +486,7 @@ fn (mut cl Cluster) answer_produce(body []u8, version i16) []u8 {
 		}
 		resp.topics << resp_topic
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -477,7 +498,7 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 	mut req := kmsg.FetchRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -522,11 +543,11 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 					continue
 				}
 				rebuilt := if b.control {
-					krec.control_marker_batch(b.base_offset, b.pid, b.epoch, b.commit, 0) or {
+					kmsg.control_marker_batch(b.base_offset, b.pid, b.epoch, b.commit, 0) or {
 						continue
 					}
 				} else {
-					krec.build_record_batch(b.records, krec.BatchOpts{
+					kmsg.build_record_batch(b.records, kmsg.BatchOpts{
 						base_offset:    b.base_offset
 						producer_id:    b.pid
 						producer_epoch: b.epoch
@@ -558,7 +579,7 @@ fn (mut cl Cluster) answer_fetch(body []u8, version i16) []u8 {
 		}
 		resp.topics << resp_topic
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -569,7 +590,7 @@ fn (mut cl Cluster) answer_list_offsets(body []u8, version i16) []u8 {
 	mut req := kmsg.ListOffsetsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -595,7 +616,7 @@ fn (mut cl Cluster) answer_list_offsets(body []u8, version i16) []u8 {
 		}
 		resp.topics << resp_topic
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -617,7 +638,7 @@ mut:
 struct FakeGroup {
 mut:
 	generation      int
-	members         map[string]FakeMember
+	members         map[string]kmsg.FakeMember
 	member_gen      map[string]int
 	protocol        string
 	assignments     map[string][]u8
@@ -630,7 +651,7 @@ mut:
 struct StoredBatch {
 mut:
 	base_offset   i64
-	records       []krec.Record // empty for control batches
+	records       []kmsg.Record // empty for control batches
 	pid           i64 = -1
 	epoch         i16 = -1
 	base_sequence int = -1
@@ -702,7 +723,7 @@ fn (mut cl Cluster) resolve_topic(name string, id [16]u8) ?string {
 
 fn (mut cl Cluster) group(name string) &FakeGroup {
 	if name !in cl.groups {
-		cl.groups[name] = &FakeGroup{}
+		cl.groups[name] = &kmsg.FakeGroup{}
 	}
 	return cl.groups[name]
 }
@@ -720,7 +741,7 @@ fn (mut cl Cluster) answer_find_coordinator(node_id int, body []u8, version i16)
 	mut req := kmsg.FindCoordinatorRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -730,7 +751,7 @@ fn (mut cl Cluster) answer_find_coordinator(node_id int, body []u8, version i16)
 		host:    '127.0.0.1'
 		port:    cl.ports[node_id]
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -739,7 +760,7 @@ fn (mut cl Cluster) answer_join_group(body []u8, version i16) []u8 {
 	mut req := kmsg.JoinGroupRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -755,7 +776,7 @@ fn (mut cl Cluster) answer_join_group(body []u8, version i16) []u8 {
 		resp.error_code = 79 // MEMBER_ID_REQUIRED
 		resp.member_id = 'kfake-member-${cl.next_member}'
 		cl.mu.unlock()
-		mut w0 := kbin.Writer{}
+		mut w0 := kmsg.Writer{}
 		resp.write_to(mut w0)
 		return w0.buf
 	}
@@ -772,7 +793,7 @@ fn (mut cl Cluster) answer_join_group(body []u8, version i16) []u8 {
 		// round) starts a fresh rebalance
 		g.generation++
 	}
-	g.members[req.member_id] = FakeMember{
+	g.members[req.member_id] = kmsg.FakeMember{
 		metadata:  meta
 		protocols: protos
 	}
@@ -797,7 +818,7 @@ fn (mut cl Cluster) answer_join_group(body []u8, version i16) []u8 {
 		}
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -806,7 +827,7 @@ fn (mut cl Cluster) answer_sync_group(body []u8, version i16) []u8 {
 	mut req := kmsg.SyncGroupRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -819,7 +840,7 @@ fn (mut cl Cluster) answer_sync_group(body []u8, version i16) []u8 {
 	if req.generation != g.generation {
 		resp.error_code = 22 // ILLEGAL_GENERATION
 		cl.mu.unlock()
-		mut we := kbin.Writer{}
+		mut we := kmsg.Writer{}
 		resp.write_to(mut we)
 		return we.buf
 	}
@@ -856,7 +877,7 @@ fn (mut cl Cluster) answer_sync_group(body []u8, version i16) []u8 {
 		}
 		time.sleep(5 * time.millisecond)
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -865,7 +886,7 @@ fn (mut cl Cluster) answer_heartbeat(body []u8, version i16) []u8 {
 	mut req := kmsg.HeartbeatRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -882,7 +903,7 @@ fn (mut cl Cluster) answer_heartbeat(body []u8, version i16) []u8 {
 		resp.error_code = 22 // ILLEGAL_GENERATION
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -891,7 +912,7 @@ fn (mut cl Cluster) answer_leave_group(body []u8, version i16) []u8 {
 	mut req := kmsg.LeaveGroupRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -908,7 +929,7 @@ fn (mut cl Cluster) answer_leave_group(body []u8, version i16) []u8 {
 	mut resp := kmsg.LeaveGroupResponse{
 		version: version
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -917,7 +938,7 @@ fn (mut cl Cluster) answer_offset_commit(body []u8, version i16) []u8 {
 	mut req := kmsg.OffsetCommitRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -950,7 +971,7 @@ fn (mut cl Cluster) answer_offset_commit(body []u8, version i16) []u8 {
 		resp.topics << rt
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -959,7 +980,7 @@ fn (mut cl Cluster) answer_offset_fetch(body []u8, version i16) []u8 {
 	mut req := kmsg.OffsetFetchRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1003,7 +1024,7 @@ fn (mut cl Cluster) answer_offset_fetch(body []u8, version i16) []u8 {
 		resp.topics << rt
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1016,7 +1037,7 @@ fn (mut cl Cluster) answer_offset_fetch(body []u8, version i16) []u8 {
 
 fn (mut cl Cluster) txn(tid string) &FakeTxn {
 	if tid !in cl.txns {
-		cl.txns[tid] = &FakeTxn{
+		cl.txns[tid] = &kmsg.FakeTxn{
 			pid:   cl.next_pid
 			epoch: -1
 		}
@@ -1029,7 +1050,7 @@ fn (mut cl Cluster) answer_init_producer_id(body []u8, version i16) []u8 {
 	mut req := kmsg.InitProducerIDRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1054,7 +1075,7 @@ fn (mut cl Cluster) answer_init_producer_id(body []u8, version i16) []u8 {
 		resp.producer_epoch = t.epoch
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1074,7 +1095,7 @@ fn (mut cl Cluster) answer_add_partitions_to_txn(body []u8, version i16) []u8 {
 	mut req := kmsg.AddPartitionsToTxnRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1101,7 +1122,7 @@ fn (mut cl Cluster) answer_add_partitions_to_txn(body []u8, version i16) []u8 {
 		resp.topics << resp_topic
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1110,7 +1131,7 @@ fn (mut cl Cluster) answer_add_offsets_to_txn(body []u8, version i16) []u8 {
 	mut req := kmsg.AddOffsetsToTxnRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1121,7 +1142,7 @@ fn (mut cl Cluster) answer_add_offsets_to_txn(body []u8, version i16) []u8 {
 		version:    version
 		error_code: code
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1130,7 +1151,7 @@ fn (mut cl Cluster) answer_txn_offset_commit(body []u8, version i16) []u8 {
 	mut req := kmsg.TxnOffsetCommitRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1160,7 +1181,7 @@ fn (mut cl Cluster) answer_txn_offset_commit(body []u8, version i16) []u8 {
 		resp.topics << resp_topic
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1169,7 +1190,7 @@ fn (mut cl Cluster) answer_end_txn(body []u8, version i16) []u8 {
 	mut req := kmsg.EndTxnRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1183,7 +1204,7 @@ fn (mut cl Cluster) answer_end_txn(body []u8, version i16) []u8 {
 		pkeys.sort()
 		for pkey in pkeys {
 			base := partition_high(cl.stored[pkey])
-			cl.stored[pkey] << StoredBatch{
+			cl.stored[pkey] << kmsg.StoredBatch{
 				base_offset: base
 				pid:         t.pid
 				epoch:       t.epoch
@@ -1193,7 +1214,7 @@ fn (mut cl Cluster) answer_end_txn(body []u8, version i16) []u8 {
 			okey := '${pkey}/${t.pid}'
 			if first := cl.open_txn[okey] {
 				if !req.commit {
-					cl.aborted[pkey] << AbortedRange{
+					cl.aborted[pkey] << kmsg.AbortedRange{
 						pid:           t.pid
 						first_offset:  first
 						marker_offset: base
@@ -1219,7 +1240,7 @@ fn (mut cl Cluster) answer_end_txn(body []u8, version i16) []u8 {
 		version:    version
 		error_code: code
 	}
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1233,7 +1254,7 @@ fn (mut cl Cluster) answer_create_topics(body []u8, version i16) []u8 {
 	mut req := kmsg.CreateTopicsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1261,7 +1282,7 @@ fn (mut cl Cluster) answer_create_topics(body []u8, version i16) []u8 {
 		}
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1270,7 +1291,7 @@ fn (mut cl Cluster) answer_delete_topics(body []u8, version i16) []u8 {
 	mut req := kmsg.DeleteTopicsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1298,7 +1319,7 @@ fn (mut cl Cluster) answer_delete_topics(body []u8, version i16) []u8 {
 		}
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1307,7 +1328,7 @@ fn (mut cl Cluster) answer_create_partitions(body []u8, version i16) []u8 {
 	mut req := kmsg.CreatePartitionsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1330,7 +1351,7 @@ fn (mut cl Cluster) answer_create_partitions(body []u8, version i16) []u8 {
 		}
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1339,7 +1360,7 @@ fn (mut cl Cluster) answer_describe_configs(body []u8, version i16) []u8 {
 	mut req := kmsg.DescribeConfigsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1378,7 +1399,7 @@ fn (mut cl Cluster) answer_describe_configs(body []u8, version i16) []u8 {
 		resp.resources << rr
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1387,7 +1408,7 @@ fn (mut cl Cluster) answer_incremental_alter_configs(body []u8, version i16) []u
 	mut req := kmsg.IncrementalAlterConfigsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1418,7 +1439,7 @@ fn (mut cl Cluster) answer_incremental_alter_configs(body []u8, version i16) []u
 		}
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1441,7 +1462,7 @@ fn (mut cl Cluster) answer_list_groups(body []u8, version i16) []u8 {
 	}
 	cl.mu.unlock()
 	_ = body
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1450,7 +1471,7 @@ fn (mut cl Cluster) answer_describe_groups(body []u8, version i16) []u8 {
 	mut req := kmsg.DescribeGroupsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1484,7 +1505,7 @@ fn (mut cl Cluster) answer_describe_groups(body []u8, version i16) []u8 {
 		resp.groups << rg
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1493,7 +1514,7 @@ fn (mut cl Cluster) answer_delete_groups(body []u8, version i16) []u8 {
 	mut req := kmsg.DeleteGroupsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1519,7 +1540,7 @@ fn (mut cl Cluster) answer_delete_groups(body []u8, version i16) []u8 {
 		}
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }
@@ -1528,7 +1549,7 @@ fn (mut cl Cluster) answer_delete_records(body []u8, version i16) []u8 {
 	mut req := kmsg.DeleteRecordsRequest{
 		version: version
 	}
-	mut r := kbin.Reader{
+	mut r := kmsg.Reader{
 		src: body
 	}
 	req.read_from(mut r) or { return []u8{} }
@@ -1563,7 +1584,7 @@ fn (mut cl Cluster) answer_delete_records(body []u8, version i16) []u8 {
 		resp.topics << rt
 	}
 	cl.mu.unlock()
-	mut w := kbin.Writer{}
+	mut w := kmsg.Writer{}
 	resp.write_to(mut w)
 	return w.buf
 }

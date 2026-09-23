@@ -102,9 +102,7 @@ fn (mut c Client) produce_attempt(topic string, mut records []Record) ! {
 	// group partitions per leader
 	mut by_leader := map[int][]int{}
 	for partition, _ in by_partition {
-		leader := c.partition_leader(topic, partition) or {
-			return error('no leader known for ${topic}[${partition}]')
-		}
+		leader := c.leader_for(topic, partition)!
 		by_leader[leader] << partition
 	}
 

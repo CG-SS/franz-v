@@ -458,9 +458,7 @@ fn (mut g GroupConsumer) position_at_committed(preserve map[string]i64) ! {
 			if cursor_key(topic, p) in cursors {
 				continue
 			}
-			leader := c.partition_leader(topic, p) or {
-				return error('no leader for ${topic}[${p}]')
-			}
+			leader := c.leader_for(topic, p)!
 			by_leader[leader] << p
 		}
 		for leader, ps in by_leader {
